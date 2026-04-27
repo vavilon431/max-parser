@@ -23,6 +23,7 @@ except Exception:
     _RU_STOPS = set()
 
 import nlp as nlp_mod
+import uuid
 
 DB_FILE                   = Path(__file__).parent / "matches.db"
 CUSTOM_STOPS_FILE         = Path(__file__).parent / "custom_stop_words.txt"
@@ -117,8 +118,9 @@ TEMPLATE = """
     .topics-title { font-size: 0.68rem; font-weight: 600; color: #8b83ff;
       text-transform: uppercase; letter-spacing: 1.5px; }
     .topics-title strong { color: #c4bfff; }
-    .topics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
-    @media(max-width:900px){ .topics-grid { grid-template-columns: 1fr; } }
+    .topics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; }
+    @media(max-width:1100px){ .topics-grid { grid-template-columns: repeat(2, 1fr); } }
+    @media(max-width:600px){ .topics-grid { grid-template-columns: 1fr; } }
     .topic-card {
       background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.06);
       border-radius: 14px; padding: 1.1rem 1.25rem;
@@ -272,6 +274,13 @@ TEMPLATE = """
     .timeline-tab:hover { color: #a09fff; border-color: rgba(108,99,255,0.3); }
     .timeline-tab.active { background: rgba(108,99,255,0.2); border-color: rgba(108,99,255,0.5); color: #c4bfff; }
     .timeline-canvas-wrap { position: relative; height: 220px; }
+    .reach-status {
+      font-size: 0.72rem; color: #6b7280; padding: 6px 10px; margin-bottom: 8px;
+      background: rgba(108,99,255,0.05); border: 1px solid rgba(108,99,255,0.15);
+      border-radius: 8px;
+    }
+    .reach-status.error { color: #e08080; background: rgba(224,82,82,0.07); border-color: rgba(224,82,82,0.25); }
+    .reach-status.done  { color: #8b83ff; }
 
     /* Post cards */
     .post-card {
@@ -419,6 +428,83 @@ TEMPLATE = """
   </div>
 </div>
 
+<!-- Search -->
+<div class="search-wrap" style="max-width: var(--page-max); margin: 0 auto 1rem; padding: 1rem 1.25rem;">
+  <form method="get" id="search-form" class="d-flex gap-2 flex-wrap">
+    <!-- Ряд 1: пресет-чіпи -->
+    <div class="preset-chips" style="width:100%">
+      {% for p, label in [('1h','Година'),('24h','Доба'),('7d','Тиждень'),('30d','Місяць'),('all','Весь час')] %}
+      <button type="submit" name="period" value="{{ p }}" class="preset-chip {% if period==p %}active{% endif %}">{{ label }}</button>
+      {% endfor %}
+      <button type="button" class="preset-chip {% if period=='custom' %}active{% endif %}" onclick="toggleCustomDates()">📅 Інше</button>
+    </div>
+
+    <!-- Ряд 2: кастомний діапазон (схований за замовчуванням) -->
+    <div id="custom-dates" class="custom-dates {% if period=='custom' %}show{% endif %}" style="width:100%">
+      <input type="hidden" name="period" value="custom">
+      <input type="date" name="from_date" class="form-control" value="{{ from_date }}" style="flex:0 0 auto">
+      <span class="dash-sep">—</span>
+      <input type="date" name="to_date"   class="form-control" value="{{ to_date }}"   style="flex:0 0 auto">
+      <button type="submit" class="btn-search">Застосувати</button>
+    </div>
+
+    <!-- Ряд 3: q + channel + sort -->
+    <input type="text" name="q" class="form-control" style="flex:1;min-width:180px;"
+           placeholder='🔍  Пошук (кілька слів = AND; OR, NOT, "точна фраза", префікс*)'
+           title='Приклади: путин лавров — оба слова; путин OR зеленский; "ядерное оружие" — фраза; крым* — префікс; путин NOT медведев'
+           value="{{ q }}">
+    <div class="channel-ac {% if channel %}has-value{% endif %}" id="channel-ac">
+      <input type="text" name="channel" id="channel-ac-input"
+             class="form-control channel-ac-input" autocomplete="off"
+             placeholder="Всі канали (почніть вводити назву)"
+             value="{{ channel }}">
+      <button type="button" class="channel-ac-clear" id="channel-ac-clear"
+              title="Скинути канал">✕</button>
+      <div class="channel-ac-list" id="channel-ac-list"></div>
+    </div>
+    <select name="sort" class="form-select" style="flex:0 0 auto;width:130px" title="Сортування">
+      <option value="new" {% if sort=='new' %}selected{% endif %}>Спочатку нові</option>
+      <option value="old" {% if sort=='old' %}selected{% endif %}>Спочатку старі</option>
+    </select>
+    <button type="submit" class="btn-search">Знайти</button>
+    <button type="submit" class="btn-search" formaction="/api/export-xlsx"
+            title="Завантажити поточну вибірку в .xlsx (актуальна кількість переглядів збирається з MAX на момент завантаження)">📥 Завантажити</button>
+    {% if q or channel or period != '24h' %}<a href="/" class="btn-clear" title="Скинути фільтри">✕</a>{% endif %}
+  </form>
+</div>
+
+<!-- Result badge -->
+<div class="result-badge" style="max-width: var(--page-max); margin: 0 auto 1rem; padding: 1rem 1.25rem;">
+  <div class="result-badge-main">
+    <span class="result-badge-icon">🔎</span>
+    <span class="result-badge-count">{{ "{:,}".format(total_count).replace(",", " ") }}</span>
+    <span class="result-badge-label">публікацій</span>
+  </div>
+  <div class="result-badge-meta">
+    {% if q %}для запиту <strong>«{{ q }}»</strong>{% endif %}
+    {% if channel %}{% if q %}·{% endif %} канал <strong>{{ channel }}</strong>{% endif %}
+    {% if period_label %}{% if q or channel %}·{% endif %} {{ period_label }}{% endif %}
+  </div>
+  {% if sparkline_svg %}<div class="result-badge-sparkline">{{ sparkline_svg | safe }}</div>{% endif %}
+</div>
+
+<!-- Динаміка згадок (інтерактивний графік) -->
+<div class="timeline-card" id="timeline-card" data-q="{{ q }}" data-channel="{{ channel }}"
+     style="max-width: var(--page-max); margin: 0 auto 1.5rem; padding: 1rem 1.25rem;">
+  <div class="timeline-head">
+    <div class="timeline-title">
+      Динаміка згадок{% if q %} <strong>«{{ q }}»</strong>{% endif %}{% if channel %} · {{ channel }}{% endif %}
+    </div>
+    <div class="timeline-tabs">
+      <button type="button" class="timeline-tab" data-days="7">7 днів</button>
+      <button type="button" class="timeline-tab active" data-days="30">30 днів</button>
+      <button type="button" class="timeline-tab" data-days="90">90 днів</button>
+    </div>
+  </div>
+  <div id="reach-status" class="reach-status" style="display:none"></div>
+  <div class="timeline-canvas-wrap"><canvas id="timeline-chart"></canvas></div>
+</div>
+
 <!-- Tops row: Топ каналів (повна ширина) -->
 <div class="tops-grid">
   <div class="sidebar-card">
@@ -496,81 +582,6 @@ TEMPLATE = """
 
   <!-- Feed -->
   <div>
-    <!-- Search -->
-    <div class="search-wrap">
-      <form method="get" id="search-form" class="d-flex gap-2 flex-wrap">
-        <!-- Ряд 1: пресет-чіпи -->
-        <div class="preset-chips" style="width:100%">
-          {% for p, label in [('1h','Година'),('24h','Доба'),('7d','Тиждень'),('30d','Місяць'),('all','Весь час')] %}
-          <button type="submit" name="period" value="{{ p }}" class="preset-chip {% if period==p %}active{% endif %}">{{ label }}</button>
-          {% endfor %}
-          <button type="button" class="preset-chip {% if period=='custom' %}active{% endif %}" onclick="toggleCustomDates()">📅 Інше</button>
-        </div>
-
-        <!-- Ряд 2: кастомний діапазон (схований за замовчуванням) -->
-        <div id="custom-dates" class="custom-dates {% if period=='custom' %}show{% endif %}" style="width:100%">
-          <input type="hidden" name="period" value="custom">
-          <input type="date" name="from_date" class="form-control" value="{{ from_date }}" style="flex:0 0 auto">
-          <span class="dash-sep">—</span>
-          <input type="date" name="to_date"   class="form-control" value="{{ to_date }}"   style="flex:0 0 auto">
-          <button type="submit" class="btn-search">Застосувати</button>
-        </div>
-
-        <!-- Ряд 3: q + channel + sort -->
-        <input type="text" name="q" class="form-control" style="flex:1;min-width:180px;"
-               placeholder='🔍  Пошук (кілька слів = AND; OR, NOT, "точна фраза", префікс*)'
-               title='Приклади: путин лавров — оба слова; путин OR зеленский; "ядерное оружие" — фраза; крым* — префікс; путин NOT медведев'
-               value="{{ q }}">
-        <div class="channel-ac {% if channel %}has-value{% endif %}" id="channel-ac">
-          <input type="text" name="channel" id="channel-ac-input"
-                 class="form-control channel-ac-input" autocomplete="off"
-                 placeholder="Всі канали (почніть вводити назву)"
-                 value="{{ channel }}">
-          <button type="button" class="channel-ac-clear" id="channel-ac-clear"
-                  title="Скинути канал">✕</button>
-          <div class="channel-ac-list" id="channel-ac-list"></div>
-        </div>
-        <select name="sort" class="form-select" style="flex:0 0 auto;width:130px" title="Сортування">
-          <option value="new" {% if sort=='new' %}selected{% endif %}>Спочатку нові</option>
-          <option value="old" {% if sort=='old' %}selected{% endif %}>Спочатку старі</option>
-        </select>
-        <button type="submit" class="btn-search">Знайти</button>
-        <button type="submit" class="btn-search" formaction="/api/export-xlsx"
-                title="Завантажити поточну вибірку в .xlsx (актуальна кількість переглядів збирається з MAX на момент завантаження)">📥 Завантажити</button>
-        {% if q or channel or period != '24h' %}<a href="/" class="btn-clear" title="Скинути фільтри">✕</a>{% endif %}
-      </form>
-    </div>
-
-    <!-- Result badge -->
-    <div class="result-badge">
-      <div class="result-badge-main">
-        <span class="result-badge-icon">🔎</span>
-        <span class="result-badge-count">{{ "{:,}".format(total_count).replace(",", " ") }}</span>
-        <span class="result-badge-label">публікацій</span>
-      </div>
-      <div class="result-badge-meta">
-        {% if q %}для запиту <strong>«{{ q }}»</strong>{% endif %}
-        {% if channel %}{% if q %}·{% endif %} канал <strong>{{ channel }}</strong>{% endif %}
-        {% if period_label %}{% if q or channel %}·{% endif %} {{ period_label }}{% endif %}
-      </div>
-      {% if sparkline_svg %}<div class="result-badge-sparkline">{{ sparkline_svg | safe }}</div>{% endif %}
-    </div>
-
-    <!-- Динаміка згадок (інтерактивний графік) -->
-    <div class="timeline-card" id="timeline-card" data-q="{{ q }}" data-channel="{{ channel }}">
-      <div class="timeline-head">
-        <div class="timeline-title">
-          Динаміка згадок{% if q %} <strong>«{{ q }}»</strong>{% endif %}{% if channel %} · {{ channel }}{% endif %}
-        </div>
-        <div class="timeline-tabs">
-          <button type="button" class="timeline-tab" data-days="7">7 днів</button>
-          <button type="button" class="timeline-tab active" data-days="30">30 днів</button>
-          <button type="button" class="timeline-tab" data-days="90">90 днів</button>
-        </div>
-      </div>
-      <div class="timeline-canvas-wrap"><canvas id="timeline-chart"></canvas></div>
-    </div>
-
     {% if posts %}
     {% for p in posts %}
     <div class="post-card">
@@ -755,10 +766,149 @@ function pluralUA(n) {                          // 1 згадка / 2 згадк
   return 'згадок';
 }
 
+function fmtBig(n) {                            // 12345 → '12.3k', 1234567 → '1.2M'
+  if (n == null) return '';
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return (n/1000).toFixed(n < 10000 ? 1 : 0) + 'k';
+  return (n/1_000_000).toFixed(n < 10_000_000 ? 1 : 0) + 'M';
+}
+
+let _reachPollTimer = null;
+let _reachCurrentDays = null;       // щоб старий polling не «затирав» свіжий графік
+
+function setReachStatus(text, cls) {
+  const el = document.getElementById('reach-status');
+  if (!el) return;
+  if (!text) { el.style.display = 'none'; el.textContent = ''; el.className = 'reach-status'; return; }
+  el.textContent = text;
+  el.className = 'reach-status' + (cls ? ' ' + cls : '');
+  el.style.display = 'block';
+}
+
+function applyReachData(reachData, days) {
+  if (!timelineChart || _reachCurrentDays !== days) return;
+  const byDate = {};
+  reachData.forEach(d => { byDate[d.date] = d.views; });
+  const values = timelineChart.data.labels.map(lbl => byDate[lbl] ?? 0);
+  // Видаляємо стару reach-лінію якщо була
+  timelineChart.data.datasets = timelineChart.data.datasets.filter(ds => ds._kind !== 'reach');
+  timelineChart.data.datasets.push({
+    _kind: 'reach',
+    label: 'Охоплення',
+    data: values,
+    yAxisID: 'yReach',
+    borderColor: '#56cfe1',
+    backgroundColor: 'rgba(86,207,225,0.08)',
+    tension: 0.3,
+    fill: false,
+    pointRadius: 2,
+    pointHoverRadius: 5,
+    pointHoverBackgroundColor: '#90e0ef',
+    borderWidth: 2,
+    borderDash: [4, 3],
+  });
+  timelineChart.options.scales.yReach = {
+    position: 'right',
+    beginAtZero: true,
+    ticks: { color: '#56cfe1', callback: (v) => fmtBig(v) },
+    grid: { drawOnChartArea: false }
+  };
+  timelineChart.options.plugins.legend = {
+    display: true,
+    labels: { color: '#6b7280', boxWidth: 14, font: { size: 11 } }
+  };
+  // Підпис «Згадки» для першого датасету
+  if (timelineChart.data.datasets[0] && !timelineChart.data.datasets[0].label) {
+    timelineChart.data.datasets[0].label = 'Згадки';
+  }
+  timelineChart.update();
+}
+
+async function loadReach(days) {
+  if (_reachPollTimer) { clearTimeout(_reachPollTimer); _reachPollTimer = null; }
+  const card = document.getElementById('timeline-card');
+  if (!card) return;
+  const q       = card.dataset.q || '';
+  const channel = card.dataset.channel || '';
+  if (!q) { setReachStatus(''); return; }       // без q охоплення не рахуємо
+
+  if (![7, 30].includes(days)) {
+    setReachStatus('Охоплення доступне для періодів 7 і 30 днів', '');
+    return;
+  }
+
+  setReachStatus('⏳ запит охоплення…');
+
+  let resp;
+  try {
+    resp = await fetch('/api/timeline-reach', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q, channel, days }),
+    }).then(r => r.json().then(j => ({ status: r.status, body: j })));
+  } catch (e) {
+    setReachStatus('Помилка мережі при запиті охоплення', 'error');
+    return;
+  }
+
+  if (resp.status === 429) {
+    setReachStatus('⏸ зайнято іншим запитом охоплення, спробуйте за 5с', 'error');
+    return;
+  }
+  if (resp.body.error === 'q_required') {
+    setReachStatus('');
+    return;
+  }
+  if (resp.status !== 200) {
+    setReachStatus('Помилка: ' + (resp.body.error || resp.status), 'error');
+    return;
+  }
+
+  if (resp.body.state === 'done') {
+    applyReachData(resp.body.data, days);
+    setReachStatus('Охоплення (з кешу): сума переглядів по днях', 'done');
+    return;
+  }
+
+  // Polling
+  const taskId = resp.body.task_id;
+  const poll = async () => {
+    if (_reachCurrentDays !== days) return;     // перемкнули період → стоп
+    let st;
+    try {
+      st = await fetch('/api/timeline-reach/' + taskId).then(r => r.json());
+    } catch (e) {
+      setReachStatus('Втрачено зв’язок з task ' + taskId, 'error');
+      return;
+    }
+    if (st.state === 'done') {
+      applyReachData(st.data, days);
+      const n = st.posts_total || 0;
+      setReachStatus(`Охоплення зібрано (постів: ${n})`, 'done');
+      return;
+    }
+    if (st.state === 'error') {
+      let msg = st.error || 'unknown';
+      if (msg.startsWith('too_many_posts:')) {
+        const n = msg.split(':')[1];
+        msg = `Постів забагато (${n}). Звузьте запит або період.`;
+      }
+      setReachStatus('Не вдалось зібрати охоплення: ' + msg, 'error');
+      return;
+    }
+    const total = st.total || 0;
+    const prog  = st.progress || 0;
+    setReachStatus(`⏳ збираємо охоплення (${prog}/${total} каналів)…`);
+    _reachPollTimer = setTimeout(poll, 2000);
+  };
+  _reachPollTimer = setTimeout(poll, 1500);
+}
+
 async function loadTimeline(days) {
   if (typeof Chart === 'undefined') return;     // CDN ще не завантажений
   const card = document.getElementById('timeline-card');
   if (!card) return;
+  _reachCurrentDays = days;
   const q       = card.dataset.q || '';
   const channel = card.dataset.channel || '';
   const params  = new URLSearchParams({ q, channel, days: String(days) });
@@ -773,7 +923,9 @@ async function loadTimeline(days) {
     data: {
       labels,
       datasets: [{
+        label: 'Згадки',
         data: values,
+        yAxisID: 'y',
         borderColor: '#8b83ff',
         backgroundColor: 'rgba(139,131,255,0.15)',
         tension: 0.3,
@@ -797,7 +949,11 @@ async function loadTimeline(days) {
           padding: 10, displayColors: false,
           callbacks: {
             title: (items) => fmtDateUA(items[0].label),
-            label: (ctx)  => ctx.parsed.y + ' ' + pluralUA(ctx.parsed.y)
+            label: (ctx) => {
+              const isReach = ctx.dataset._kind === 'reach';
+              if (isReach) return 'Охоплення: ' + fmtBig(ctx.parsed.y) + ' переглядів';
+              return ctx.parsed.y + ' ' + pluralUA(ctx.parsed.y);
+            }
           }
         }
       },
@@ -814,6 +970,7 @@ async function loadTimeline(days) {
           grid: { color: 'rgba(255,255,255,0.04)' }
         },
         y: {
+          position: 'left',
           beginAtZero: true,
           ticks: { color: '#4a5568', precision: 0 },
           grid: { color: 'rgba(255,255,255,0.04)' }
@@ -821,6 +978,13 @@ async function loadTimeline(days) {
       }
     }
   });
+
+  // Охоплення підвантажуємо асинхронно; працює лише за наявності q.
+  if (q) {
+    loadReach(days);
+  } else {
+    setReachStatus('');
+  }
 }
 
 // ── Завантаження xlsx: візуальний фідбек і захист від подвійного кліку ──────
@@ -1175,6 +1339,117 @@ _timeline_cache: dict[tuple, tuple[float, list]] = {}
 _timeline_lock = threading.Lock()
 
 
+# ── Reach (охоплення = sum(views) по днях) ────────────────────────────────────
+# Збір повільний (WS до MAX), тому асинхронна модель: POST стартує task,
+# GET <task_id> опитує прогрес. Кеш 15 хв на (q, channel, days).
+# Глобальний семафор: одночасно лише один reach-task (login-токен MAX один).
+
+_REACH_CACHE_TTL = 900           # 15 хв
+_REACH_MAX_POSTS = 1000          # запобіжник: понад — відмова
+_REACH_ALLOWED_DAYS = (7, 30)    # 90 — занадто
+_REACH_TASK_TTL = 1800           # таски прибираємо через 30 хв
+
+_reach_cache: dict[tuple, tuple[float, list]] = {}
+_reach_tasks: dict[str, dict] = {}
+_reach_lock = threading.Lock()
+_reach_running: dict[str, bool] = {"busy": False}
+
+
+def _reach_gc():
+    """Прибрати старі таски, щоб не накопичувались у пам'яті."""
+    now = time.time()
+    with _reach_lock:
+        stale = [tid for tid, t in _reach_tasks.items()
+                 if now - t.get("ts_done", t["ts_started"]) > _REACH_TASK_TTL]
+        for tid in stale:
+            _reach_tasks.pop(tid, None)
+
+
+def _run_reach_task(task_id: str, q: str, channel: str, days: int):
+    """Worker: SELECT матчених постів → fetch_views → агрегація по днях."""
+    import views_fetcher
+
+    task = _reach_tasks[task_id]
+    try:
+        db = get_db()
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        fts_q = build_fts_query(q)
+        sql = ("SELECT messages.chat_id AS chat_id, messages.msg_id AS msg_id, "
+               "       messages.msg_time AS msg_time, date(messages.saved_at) AS d "
+               "FROM messages JOIN messages_fts ON messages.id = messages_fts.rowid "
+               "WHERE messages_fts MATCH ? AND messages.saved_at >= ?")
+        params: list = [fts_q, cutoff]
+        if channel:
+            sql += " AND messages.channel_title = ?"
+            params.append(channel)
+        sql += f" ORDER BY messages.saved_at DESC LIMIT {_REACH_MAX_POSTS + 1}"
+
+        try:
+            rows = [dict(r) for r in db.execute(sql, params).fetchall()]
+        except sqlite3.OperationalError as e:
+            task.update(state="error", error=f"SQL: {e}", ts_done=time.time())
+            return
+        finally:
+            db.close()
+
+        if len(rows) > _REACH_MAX_POSTS:
+            task.update(
+                state="error",
+                error=f"too_many_posts:{len(rows)}",
+                ts_done=time.time(),
+            )
+            return
+
+        if not rows:
+            task.update(state="done", data=[], ts_done=time.time())
+            return
+
+        # Прогрес з логів views_fetcher: "[views] N/M chat=..."
+        progress_re = re.compile(r"\[views\]\s+(\d+)/(\d+)\s+chat=")
+
+        def log_capture(msg):
+            print(msg, flush=True)
+            m = progress_re.search(str(msg))
+            if m:
+                task["progress"] = int(m.group(1))
+                task["total"] = int(m.group(2))
+
+        # Грубо: total = кількість унікальних каналів (буде уточнено першим логом)
+        task["total"] = len({r["chat_id"] for r in rows})
+        task["progress"] = 0
+        task["state"] = "running"
+
+        posts_for_views = [
+            {"chat_id": r["chat_id"], "msg_id": r["msg_id"], "msg_time": r["msg_time"]}
+            for r in rows
+        ]
+        views_map = views_fetcher.fetch_views(posts_for_views, log=log_capture)
+
+        # Агрегація по днях
+        sums: dict[str, int] = {}
+        for r in rows:
+            v = views_map.get((r["chat_id"], str(r["msg_id"])))
+            if isinstance(v, int):
+                sums[r["d"]] = sums.get(r["d"], 0) + v
+
+        today = datetime.now().date()
+        result = []
+        for i in range(days - 1, -1, -1):
+            d = (today - timedelta(days=i)).isoformat()
+            result.append({"date": d, "views": sums.get(d, 0)})
+
+        cache_key = (q, channel, days)
+        with _reach_lock:
+            _reach_cache[cache_key] = (time.time(), result)
+
+        task.update(state="done", data=result, ts_done=time.time(),
+                    posts_total=len(rows))
+    except Exception as e:
+        task.update(state="error", error=f"exception: {e}", ts_done=time.time())
+    finally:
+        _reach_running["busy"] = False
+
+
 _ALLOWED_TIMELINE_DAYS = (7, 30, 90)
 
 
@@ -1469,6 +1744,76 @@ def api_timeline():
     return jsonify(data)
 
 
+@app.route("/api/timeline-reach", methods=["POST"])
+def api_timeline_reach_start():
+    q       = (request.json or {}).get("q", "").strip() if request.is_json else request.form.get("q", "").strip()
+    channel = (request.json or {}).get("channel", "").strip() if request.is_json else request.form.get("channel", "").strip()
+    try:
+        days = int((request.json or {}).get("days", 30)) if request.is_json else int(request.form.get("days", 30))
+    except (ValueError, TypeError):
+        days = 30
+
+    if not q:
+        return jsonify({"error": "q_required"}), 400
+    if days not in _REACH_ALLOWED_DAYS:
+        days = 30
+
+    cache_key = (q, channel, days)
+    with _reach_lock:
+        cached = _reach_cache.get(cache_key)
+        if cached and time.time() - cached[0] < _REACH_CACHE_TTL:
+            return jsonify({
+                "task_id": "cached",
+                "state": "done",
+                "data": cached[1],
+                "cached": True,
+            })
+
+    _reach_gc()
+
+    # Глобальний семафор — лише один task одночасно
+    with _reach_lock:
+        if _reach_running["busy"]:
+            return jsonify({"error": "busy", "retry_after": 5}), 429
+        _reach_running["busy"] = True
+
+        task_id = uuid.uuid4().hex[:12]
+        _reach_tasks[task_id] = {
+            "state": "pending",
+            "progress": 0,
+            "total": 0,
+            "data": None,
+            "error": None,
+            "ts_started": time.time(),
+            "params": {"q": q, "channel": channel, "days": days},
+        }
+
+    threading.Thread(
+        target=_run_reach_task, args=(task_id, q, channel, days), daemon=True
+    ).start()
+
+    return jsonify({"task_id": task_id, "state": "pending"})
+
+
+@app.route("/api/timeline-reach/<task_id>")
+def api_timeline_reach_status(task_id: str):
+    with _reach_lock:
+        task = _reach_tasks.get(task_id)
+    if not task:
+        return jsonify({"error": "unknown_task"}), 404
+    out = {
+        "state":    task["state"],
+        "progress": task.get("progress", 0),
+        "total":    task.get("total", 0),
+    }
+    if task["state"] == "done":
+        out["data"] = task["data"]
+        out["posts_total"] = task.get("posts_total", 0)
+    elif task["state"] == "error":
+        out["error"] = task.get("error", "unknown")
+    return jsonify(out)
+
+
 @app.route("/api/top-words")
 def api_top_words():
     period = request.args.get("period", "day")
@@ -1730,10 +2075,35 @@ def index():
         "SELECT DISTINCT channel_title FROM messages ORDER BY channel_title"
     ).fetchall()]
 
-    # Топ каналів
-    top_channels = db.execute(
-        "SELECT channel_title, channel_link, COUNT(*) as cnt FROM messages GROUP BY channel_title ORDER BY cnt DESC LIMIT 20"
-    ).fetchall()
+    # Топ каналів — якщо є q, рахуємо лише серед постів, що матчать запит
+    # (час тако ж враховуємо, щоб top відповідав поточному вікну фільтрів)
+    if q:
+        tc_from = ("FROM messages JOIN messages_fts ON messages.id = messages_fts.rowid "
+                   "WHERE messages_fts MATCH ?")
+        tc_params = [build_fts_query(q)]
+        if since_ts:
+            tc_from += " AND messages.saved_at >= ?"
+            tc_params.append(since_ts)
+        if until_ts:
+            tc_from += " AND messages.saved_at <= ?"
+            tc_params.append(until_ts)
+        try:
+            top_channels = db.execute(
+                f"SELECT messages.channel_title AS channel_title, "
+                f"       messages.channel_link  AS channel_link, "
+                f"       COUNT(*) AS cnt "
+                f"{tc_from} "
+                f"GROUP BY messages.channel_title "
+                f"ORDER BY cnt DESC LIMIT 20",
+                tc_params
+            ).fetchall()
+        except sqlite3.OperationalError:
+            top_channels = []
+    else:
+        top_channels = db.execute(
+            "SELECT channel_title, channel_link, COUNT(*) as cnt "
+            "FROM messages GROUP BY channel_title ORDER BY cnt DESC LIMIT 20"
+        ).fetchall()
 
     # Топ слів (з урахуванням обраного каналу)
     top_words = get_top_words(db, words_period, channel)
