@@ -1,0 +1,23 @@
+[Unit]
+Description=MAX Parser Dashboard — Flask web UI on :8080
+After=network-online.target max-parser.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+ExecStart=/usr/bin/python3 -u /root/dashboard.py
+Restart=on-failure
+RestartSec=15
+# Логи у systemd journal (вбудована ротація). Перегляд:
+#   journalctl -u max-dashboard -f
+#   journalctl -u max-dashboard --since today
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=max-dashboard
+# Natasha + Flask — до 800 МБ
+MemoryMax=800M
+
+[Install]
+WantedBy=multi-user.target

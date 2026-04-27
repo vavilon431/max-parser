@@ -1,0 +1,23 @@
+[Unit]
+Description=MAX Parser — WebSocket monitor for 2000+ channels
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+ExecStart=/usr/bin/python3 -u /root/ws_parser.py
+Restart=on-failure
+RestartSec=20
+# Логи у systemd journal (вбудована ротація). Перегляд:
+#   journalctl -u max-parser -f
+#   journalctl -u max-parser --since today
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=max-parser
+# Обмеження RAM (VPS 1-2 ГБ — парсер не повинен жерти більше 600 МБ)
+MemoryMax=600M
+
+[Install]
+WantedBy=multi-user.target

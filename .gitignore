@@ -1,0 +1,53 @@
+# Секрети — НІКОЛИ не комітити
+.login_token
+.device_id
+.env
+*.key
+*.pem
+
+# База даних і її артефакти
+matches.db
+matches.db-journal
+matches.db-wal
+matches.db-shm
+*.sqlite
+*.sqlite3
+
+# Логи
+*.log
+parser.log
+dashboard.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.python-version
+
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Розвідувальні дампи (артефакти reverse-engineering, не код)
+scout_results.json
+scout_views_dump.json
+playwright_results.json
+
+# Тестові експорти xlsx (приклад_формату.xlsx — лишаємо як reference)
+example/export_test.xlsx
+example/export_*.xlsx
+
+# Користувацькі стоп-слова (накопичуються через UI, не код)
+custom_stop_words.txt
+
+# Резолвлені канали (генерується resolve_channels.py, не повинен бути в git)
+channels/resolved.json
+
+# Тимчасові нотатки/скретчі (особисті, не для репо)
+*.tmp
+*.bak
+Парсер вже запущений і працює на VP.txt
