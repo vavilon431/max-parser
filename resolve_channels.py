@@ -172,7 +172,7 @@ async def main():
     aliases = load_aliases()
 
     # Завантаження попереднього прогресу
-    resolved: dict[str, int] = {}
+    resolved: dict[str, dict] = {}
     failed_set: set[str] = set()
     if RESOLVED_FILE.exists():
         resolved = json.loads(RESOLVED_FILE.read_text(encoding="utf-8"))

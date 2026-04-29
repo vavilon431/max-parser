@@ -3,6 +3,53 @@
 
 ---
 
+## [2026-04-29 15:25] — v3.4: Ревізія коду — XSS-фікс, кеш гарячих SELECT-ів, оптимізація NLP
+
+**Ключові зміни:**
+
+Безпека (XSS у тематичній аналітиці) ([dashboard.py](../dashboard.py)):
+- Топ слів: `onclick="addStopWord(event,'{{ word }}')"` → `onclick='addStopWord(event, {{ word|tojson }})'`. У JS-рендері — `JSON.stringify(word)` + `escapeHtml`. Лема могла містити `'`/`"`/`<` (NER видає сутності типу `O'Brien`) і ламати JS / відкривати інʼєкцію.
+- href: `/?q={{ word }}` → `/?q={{ word|urlencode }}` (рядки 561, 517 — топ слів і топ каналів)
+
+Виправлено false-positive ребілд baseline при кожному рестарті ([dashboard.py:1679-1716](../dashboard.py)):
+- Раніше `_baseline_state["last_built"]=0.0` при старті → `time.time() - 0 > 86400` завжди True → scheduler одразу запускав 30-хв ребілд навіть на свіжому baseline
+- Додано `_read_baseline_built_at(db)` — читає `MAX(updated_at)` з `baseline_lemma_freq` і насіває `last_built` справжнім значенням з БД
+- Підтверджено в логах після деплою: `[baseline] starting rebuild...` НЕ зʼявився при старті
+
+Race condition у кеші топ-слів ([dashboard.py:1725-1726](../dashboard.py)):
+- `_top_words_cache.clear()` був поза `_top_words_lock` (могло конфліктувати з фоновим воркером, що пише результат)
+- Загорнуто в `with _top_words_lock:`
+
+Перформанс — кеш гарячих SELECT-ів ([dashboard.py:1313-1376](../dashboard.py)):
+- `SELECT DISTINCT channel_title` і `GROUP BY channel_title` — повний скан на кожен рендер `/`
+- Винесено в `get_channel_list(db)` (TTL 300с) і `get_top_channels(db, q, since, until)` (TTL 60с з ключем по q+вікно)
+- Прибрано 60+ рядків з `index()` — тепер 2 виклики кеш-функцій
+- Реальний ефект на VPS (89k постів): `GET /` cold 581мс → warm 256мс (-56%)
+
+NER tokenize: `_in_ner` O(N×M) → O(1) ([nlp.py:148-173](../nlp.py)):
+- Раніше для кожного токена крутився повний цикл по всіх NER-spans (`for s,e in ranges: if tok.start>=s and tok.stop<=e`)
+- Замінено на `set(id(tok) for span in doc.spans for tok in span.tokens)` — O(1) lookup. На довгих постах (1000+ токенів × 5-10 spans) скорочує `tokenize_categorized` помітно
+
+Обмеження `build_baseline` ([nlp.py:259-280](../nlp.py)):
+- Додано `BASELINE_MAX_DOCS = 10_000` + `ORDER BY RANDOM() LIMIT ?` у SELECT
+- Раніше нічний ребілд крутив усі пости старші 30 днів через повний Natasha-pipeline (~30-60мс/пост × 50k+ = десятки хвилин). Тепер cap на 10k → ~8-10хв
+- Параметр `max_docs=BASELINE_MAX_DOCS` опційний — не ламає викликів
+
+Залежності ([requirements.txt](../requirements.txt), [requirements-dev.txt](../requirements-dev.txt)):
+- Розділено на prod/dev. Prod лишає flask/nltk/natasha/websockets/openpyxl
+- `playwright`, `httpx[socks]` винесено у dev (потрібні лише для одноразової розвідки `scout.py`/`playwright_scout.py`, не для VPS-сервісів)
+- На VPS `pip install -r requirements.txt` тепер тягне на ~200 МБ менше
+
+Дрібниці:
+- `asyncio.get_event_loop()` → `asyncio.get_running_loop()` у [ws_parser.py:213](../ws_parser.py) і [views_fetcher.py:83](../views_fetcher.py) (deprecation у Python 3.10+)
+- Виправлено type hint `dict[str, int]` → `dict[str, dict]` у [resolve_channels.py:175](../resolve_channels.py) (реально зберігає {id, title, subs})
+
+**Поточний стан:** Деплой на VPS успішний (15:21). FTS індекс консистентний (probe 81756 / 88972 повідомлень). Smoke-тести: `GET /` 200, `GET /?q=путин` 200/73мс, `/api/top-words` 200/8мс. NLP-пайплайн готовий, 467 тематичних коренів. Парсер активно пише пости.
+
+**Наступний крок:** Винести спільний WS handshake (`connect`+`login`) у `ws_common.py` — зараз продубльовано в трьох файлах ([ws_parser.py](../ws_parser.py), [resolve_channels.py](../resolve_channels.py), [views_fetcher.py](../views_fetcher.py)). Далі — розпаралелити `views_fetcher` (3-5 одночасних WS conn-ів) для прискорення великих xlsx-експортів.
+
+---
+
 ## [2026-04-27 20:36] — v3.3: Перепланування дашборду + лінія охоплення на timeline
 
 **Ключові зміни:**

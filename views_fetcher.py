@@ -80,7 +80,7 @@ class _Client:
     async def send_op(self, opcode: int, payload: dict, timeout: float = WS_TIMEOUT):
         s = self._ns()
         msg = json.dumps({"ver": 11, "cmd": 0, "seq": s, "opcode": opcode, "payload": payload}, ensure_ascii=False)
-        fut = asyncio.get_event_loop().create_future()
+        fut = asyncio.get_running_loop().create_future()
         self._pending[s] = fut
         await self._ws.send(msg)
         try:

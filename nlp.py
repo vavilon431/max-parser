@@ -146,32 +146,27 @@ def tokenize_categorized(text: str, extra_stops: set[str] | None = None
         return empty
 
     out: dict[str, list[str]] = {c: [] for c in CATEGORIES}
-    ner_token_ranges: list[tuple[int, int]] = []  # [(start, stop), ...]
+    ner_token_ids: set[int] = set()  # id() токенів, що належать NER-спанам
 
-    # NER spans → персони / локації / організації; зберігаємо діапазони токенів,
-    # щоб не дублювати їх у "term".
+    # NER spans → персони / локації / організації; запам'ятовуємо id() токенів
+    # span.tokens, щоб у наступному циклі не дублювати їх у "term" (O(1) замість O(N×M)).
     for span in doc.spans:
         try:
             span.normalize(morph_vocab)
         except Exception:
             pass
         norm = _norm_entity(span.normal or span.text or "")
-        ner_token_ranges.append((span.start, span.stop))
+        for tok in span.tokens:
+            ner_token_ids.add(id(tok))
         if len(norm) < 2 or norm in stops:
             continue
         cat = {"PER": "per", "LOC": "loc", "ORG": "org"}.get(span.type)
         if cat:
             out[cat].append(norm)
 
-    def _in_ner(tok) -> bool:
-        for s, e in ner_token_ranges:
-            if tok.start >= s and tok.stop <= e:
-                return True
-        return False
-
     # Решта значущих токенів → "term" якщо проходить тематичний фільтр.
     for token in doc.tokens:
-        if _in_ner(token):
+        if id(token) in ner_token_ids:
             continue
         if token.pos not in _GOOD_POS:
             continue
@@ -256,22 +251,26 @@ def load_baseline(db: sqlite3.Connection) -> tuple[dict[str, int], int]:
     return baseline_df, n_docs
 
 
+BASELINE_MAX_DOCS = 10_000  # cap: повний пайплайн ~30-60мс/пост, 10k≈8-10хв.
+
+
 def build_baseline(db: sqlite3.Connection, days_back: int = 30,
-                   extra_stops: set[str] | None = None) -> tuple[int, int]:
+                   extra_stops: set[str] | None = None,
+                   max_docs: int = BASELINE_MAX_DOCS) -> tuple[int, int]:
     """
     Перебудовує baseline з БД. Зберігає категоризовані ключі "category::lemma".
+    Якщо постів старших за period > max_docs — беремо рівномірну випадкову вибірку
+    (SQLite ORDER BY RANDOM() LIMIT) щоб не блокувати Natasha-pipeline на години.
     """
     init_baseline_schema(db)
     cutoff_old = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d %H:%M:%S")
 
-    rows = db.execute(
-        "SELECT text FROM messages WHERE saved_at < ?", (cutoff_old,)
-    ).fetchall()
+    sql = ("SELECT text FROM messages WHERE saved_at < ? "
+           "ORDER BY RANDOM() LIMIT ?")
+    rows = db.execute(sql, (cutoff_old, max_docs)).fetchall()
     if not rows:
         cutoff_today = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
-        rows = db.execute(
-            "SELECT text FROM messages WHERE saved_at < ?", (cutoff_today,)
-        ).fetchall()
+        rows = db.execute(sql, (cutoff_today, max_docs)).fetchall()
     if not rows:
         return 0, 0
 

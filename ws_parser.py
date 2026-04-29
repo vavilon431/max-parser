@@ -210,7 +210,7 @@ class WSClient:
 
     async def _send_recv(self, opcode: int, payload: dict, timeout: float = 10) -> dict | None:
         s = self._ns()
-        fut = asyncio.get_event_loop().create_future()
+        fut = asyncio.get_running_loop().create_future()
         self._pending[s] = fut
         await self._ws.send(json.dumps(
             {"ver": 11, "cmd": 0, "seq": s, "opcode": opcode, "payload": payload},

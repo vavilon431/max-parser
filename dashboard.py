@@ -514,7 +514,7 @@ TEMPLATE = """
     {% set display_name = ch.channel_title if ch.channel_title and not ch.channel_title.lstrip('-').isdigit() else ch.channel_link.split('/')[-1] %}
     <div class="channel-row">
       <div class="d-flex justify-content-between align-items-center">
-        <a href="/?channel={{ ch.channel_title }}" class="channel-row-link">{{ display_name }}</a>
+        <a href="/?channel={{ ch.channel_title|urlencode }}" class="channel-row-link">{{ display_name }}</a>
         <span class="channel-row-cnt">{{ ch.cnt }}</span>
       </div>
       <div class="channel-bar-track">
@@ -558,8 +558,8 @@ TEMPLATE = """
           <div class="word-row">
             <div class="d-flex justify-content-between align-items-center">
               <span class="d-flex align-items-center gap-2" style="min-width:0">
-                <a href="/?q={{ word }}" class="word-row-link">{{ word }}</a>
-                <button class="stop-btn" title="Додати до стоп-слів" onclick="addStopWord(event,'{{ word }}')">✕</button>
+                <a href="/?q={{ word|urlencode }}" class="word-row-link">{{ word }}</a>
+                <button class="stop-btn" title="Додати до стоп-слів" onclick='addStopWord(event, {{ word|tojson }})'>✕</button>
               </span>
               <span class="word-row-cnt" title="кількість згадок">{{ cnt }}</span>
             </div>
@@ -660,13 +660,13 @@ function renderCategoryRows(rows) {
   const maxScore = rows[0][2] > 0 ? rows[0][2] : 1;
   return rows.map(([word, cnt, score]) => {
     const w = escapeHtml(word);
-    const wAttr = w.replace(/'/g, "\\'");
+    const wJson = escapeHtml(JSON.stringify(word));
     return `
       <div class="word-row">
         <div class="d-flex justify-content-between align-items-center">
           <span class="d-flex align-items-center gap-2" style="min-width:0">
             <a href="/?q=${encodeURIComponent(word)}" class="word-row-link">${w}</a>
-            <button class="stop-btn" title="Додати до стоп-слів" onclick="addStopWord(event,'${wAttr}')">✕</button>
+            <button class="stop-btn" title="Додати до стоп-слів" onclick='addStopWord(event, ${wJson})'>✕</button>
           </span>
           <span class="word-row-cnt" title="кількість згадок">${cnt}</span>
         </div>
@@ -1314,6 +1314,64 @@ _STATS_CACHE_TTL = 30
 _stats_cache: tuple[float, dict] | None = None
 _stats_lock = threading.Lock()
 
+# DISTINCT channel_title і GROUP BY по messages — повний скан таблиці на кожен
+# рендер `/`. Кешуємо: список каналів змінюється рідко, топ — теж не миттєво.
+_CHANNEL_LIST_TTL = 300
+_TOP_CHANNELS_TTL = 60
+_channel_list_cache: tuple[float, list] | None = None
+_channel_list_lock = threading.Lock()
+_top_channels_cache: dict[tuple, tuple[float, list]] = {}
+_top_channels_lock = threading.Lock()
+
+
+def get_channel_list(db) -> list[str]:
+    global _channel_list_cache
+    with _channel_list_lock:
+        if _channel_list_cache and time.time() - _channel_list_cache[0] < _CHANNEL_LIST_TTL:
+            return _channel_list_cache[1]
+    rows = db.execute(
+        "SELECT DISTINCT channel_title FROM messages ORDER BY channel_title"
+    ).fetchall()
+    data = [r[0] for r in rows]
+    with _channel_list_lock:
+        _channel_list_cache = (time.time(), data)
+    return data
+
+
+def get_top_channels(db, q: str, since_ts: str | None, until_ts: str | None) -> list:
+    key = (q, since_ts, until_ts)
+    with _top_channels_lock:
+        cached = _top_channels_cache.get(key)
+        if cached and time.time() - cached[0] < _TOP_CHANNELS_TTL:
+            return cached[1]
+
+    if q:
+        tc_from = ("FROM messages JOIN messages_fts ON messages.id = messages_fts.rowid "
+                   "WHERE messages_fts MATCH ?")
+        params: list = [build_fts_query(q)]
+        if since_ts:
+            tc_from += " AND messages.saved_at >= ?"
+            params.append(since_ts)
+        if until_ts:
+            tc_from += " AND messages.saved_at <= ?"
+            params.append(until_ts)
+        sql = (f"SELECT messages.channel_title AS channel_title, "
+               f"       messages.channel_link  AS channel_link, "
+               f"       COUNT(*) AS cnt {tc_from} "
+               f"GROUP BY messages.channel_title ORDER BY cnt DESC LIMIT 20")
+    else:
+        sql = ("SELECT channel_title, channel_link, COUNT(*) as cnt "
+               "FROM messages GROUP BY channel_title ORDER BY cnt DESC LIMIT 20")
+        params = []
+
+    try:
+        rows = db.execute(sql, params).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    with _top_channels_lock:
+        _top_channels_cache[key] = (time.time(), rows)
+    return rows
+
 def get_stats(db) -> dict:
     global _stats_cache
     with _stats_lock:
@@ -1676,6 +1734,22 @@ def _rebuild_baseline_once():
         db.close()
 
 
+def _read_baseline_built_at(db) -> float:
+    """Повертає UNIX-час останнього оновлення baseline з BD (0.0 якщо порожнє)."""
+    try:
+        row = db.execute(
+            f"SELECT MAX(updated_at) FROM {nlp_mod.BASELINE_TABLE}"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 0.0
+    if not row or not row[0]:
+        return 0.0
+    try:
+        return datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        return 0.0
+
+
 def baseline_scheduler():
     """Фоновий потік: перевіряє раз на годину чи треба перебудувати baseline."""
     def _loop():
@@ -1684,9 +1758,13 @@ def baseline_scheduler():
             try:
                 db = get_db()
                 _, n_docs = nlp_mod.load_baseline(db)
+                built_at = _read_baseline_built_at(db) if n_docs > 0 else 0.0
                 db.close()
-                need_rebuild = (n_docs == 0) or \
-                               (time.time() - _baseline_state["last_built"] > BASELINE_REBUILD_INTERVAL)
+                with _baseline_state_lock:
+                    if built_at > _baseline_state["last_built"]:
+                        _baseline_state["last_built"] = built_at
+                age = time.time() - _baseline_state["last_built"]
+                need_rebuild = (n_docs == 0) or (age > BASELINE_REBUILD_INTERVAL)
                 if need_rebuild:
                     print("[baseline] starting rebuild...", flush=True)
                     _rebuild_baseline_once()
@@ -1722,7 +1800,8 @@ def api_add_stop_word():
     existing = load_custom_stops()
     if word not in existing:
         save_custom_stop(word)
-    _top_words_cache.clear()
+    with _top_words_lock:
+        _top_words_cache.clear()
     return jsonify({"ok": True, "word": word})
 
 
@@ -2070,40 +2149,12 @@ def index():
             params + [per_page, offset]
         ).fetchall()
 
-    # Список каналів для фільтру
-    channel_list = [r[0] for r in db.execute(
-        "SELECT DISTINCT channel_title FROM messages ORDER BY channel_title"
-    ).fetchall()]
+    # Список каналів для фільтру (TTL 300с — рідко змінюється)
+    channel_list = get_channel_list(db)
 
-    # Топ каналів — якщо є q, рахуємо лише серед постів, що матчать запит
-    # (час тако ж враховуємо, щоб top відповідав поточному вікну фільтрів)
-    if q:
-        tc_from = ("FROM messages JOIN messages_fts ON messages.id = messages_fts.rowid "
-                   "WHERE messages_fts MATCH ?")
-        tc_params = [build_fts_query(q)]
-        if since_ts:
-            tc_from += " AND messages.saved_at >= ?"
-            tc_params.append(since_ts)
-        if until_ts:
-            tc_from += " AND messages.saved_at <= ?"
-            tc_params.append(until_ts)
-        try:
-            top_channels = db.execute(
-                f"SELECT messages.channel_title AS channel_title, "
-                f"       messages.channel_link  AS channel_link, "
-                f"       COUNT(*) AS cnt "
-                f"{tc_from} "
-                f"GROUP BY messages.channel_title "
-                f"ORDER BY cnt DESC LIMIT 20",
-                tc_params
-            ).fetchall()
-        except sqlite3.OperationalError:
-            top_channels = []
-    else:
-        top_channels = db.execute(
-            "SELECT channel_title, channel_link, COUNT(*) as cnt "
-            "FROM messages GROUP BY channel_title ORDER BY cnt DESC LIMIT 20"
-        ).fetchall()
+    # Топ каналів: якщо є q — серед матчених, інакше глобальний.
+    # Час враховуємо, щоб top відповідав поточному вікну фільтрів (TTL 60с).
+    top_channels = get_top_channels(db, q, since_ts, until_ts)
 
     # Топ слів (з урахуванням обраного каналу)
     top_words = get_top_words(db, words_period, channel)

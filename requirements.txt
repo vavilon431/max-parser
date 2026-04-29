@@ -1,5 +1,3 @@
-httpx[socks]>=0.27.0
-playwright>=1.44.0
 flask>=3.0.0
 nltk>=3.8
 natasha>=1.6.0
