@@ -1,0 +1,32 @@
+# Alert-канали: оповіщення про БПЛА, ракетну небезпеку, радари, ППО, тривоги.
+# По одному alias на рядок (без https://max.ru/). Регістр не важливий.
+# Порожні рядки і коментарі (#) ігноруються.
+# Файл перечитується автоматично за mtime — рестарт dashboard не потрібен.
+
+LPRalarm
+klg_alarm
+trevozhnyy_donetsk
+russia_rradar
+vrv_radar
+radarr_russia
+crimea_radar82
+RDFradar
+radarb31
+first_radar
+Radar_Moscow_99
+radarrussiia_novosti
+kuban_radar
+Radar_Cheboksary
+Radar_Razan
+lokatorRU
+Rosgvard_PVO
+favt_drone
+BelgorodDRONE
+Info_bpla_Shebekino
+info_bpla_yaruga_rakitnoe
+info_bpla_grayvoron
+info_bpla_borisovka
+info_bpla_volokonovka
+locatorru
+krnew
+kerch_onlinee

@@ -5,6 +5,7 @@ MAX Parser Dashboard — Flask веб-інтерфейс для перегляд
 from flask import Flask, render_template_string, request, jsonify, Response
 import sqlite3
 import re
+import random
 import time
 import threading
 import io
@@ -27,6 +28,7 @@ import uuid
 
 DB_FILE                   = Path(__file__).parent / "matches.db"
 CUSTOM_STOPS_FILE         = Path(__file__).parent / "custom_stop_words.txt"
+ALERT_CHANNELS_FILE       = Path(__file__).parent / "channels" / "alert_channels.txt"
 TOP_WORDS_CACHE_TTL       = 300
 BASELINE_REBUILD_INTERVAL = 24 * 3600
 # NER+syntax pipeline ~30-60ms/пост → обмежуємо вибірку щоб первинний прорахунок
@@ -103,9 +105,9 @@ TEMPLATE = """
     .stat-number { font-size: 1.9rem; font-weight: 700; color: #fff; line-height: 1; }
     .stat-label { font-size: 0.72rem; color: #4a5568; text-transform: uppercase; letter-spacing: 1.2px; margin-top: 4px; }
 
-    /* Tops row (Топ каналів — повна ширина) */
+    /* Tops row (Топ каналів). Один список — повна ширина, два — 50/50 на широких. */
     .tops-grid {
-      display: grid; grid-template-columns: 1fr; gap: 1rem;
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 1rem;
       max-width: var(--page-max); margin: 0 auto 1rem; padding: 0 var(--page-pad);
     }
 
@@ -511,10 +513,10 @@ TEMPLATE = """
   <div class="timeline-canvas-wrap"><canvas id="timeline-chart"></canvas></div>
 </div>
 
-<!-- Tops row: Топ каналів (повна ширина) -->
+<!-- Tops row: Топ каналів. Без q — два списки (основний + alert), з q — один. -->
 <div class="tops-grid">
   <div class="sidebar-card">
-    <div class="sidebar-title">Топ каналів</div>
+    <div class="sidebar-title">{% if top_channels_alert is not none %}Топ каналів — основний потік{% else %}Топ каналів{% endif %}</div>
     {% set max_cnt = top_channels[0].cnt if top_channels else 1 %}
     {% for ch in top_channels %}
     {% set display_name = ch.channel_title if ch.channel_title and not ch.channel_title.lstrip('-').isdigit() else ch.channel_link.split('/')[-1] %}
@@ -529,6 +531,28 @@ TEMPLATE = """
     </div>
     {% endfor %}
   </div>
+  {% if top_channels_alert is not none %}
+  <div class="sidebar-card">
+    <div class="sidebar-title">Топ каналів — БПЛА / тривоги / радари</div>
+    {% if top_channels_alert %}
+    {% set max_cnt_alert = top_channels_alert[0].cnt %}
+    {% for ch in top_channels_alert %}
+    {% set display_name = ch.channel_title if ch.channel_title and not ch.channel_title.lstrip('-').isdigit() else ch.channel_link.split('/')[-1] %}
+    <div class="channel-row">
+      <div class="d-flex justify-content-between align-items-center">
+        <a href="/?channel={{ ch.channel_title|urlencode }}" class="channel-row-link">{{ display_name }}</a>
+        <span class="channel-row-cnt">{{ ch.cnt }}</span>
+      </div>
+      <div class="channel-bar-track">
+        <div class="channel-bar-fill" style="width:{{ (ch.cnt / max_cnt_alert * 100)|int }}%"></div>
+      </div>
+    </div>
+    {% endfor %}
+    {% else %}
+    <div class="topic-empty">Список <code>channels/alert_channels.txt</code> порожній або без активності за період</div>
+    {% endif %}
+  </div>
+  {% endif %}
 </div>
 
 <!-- Topics analytics: 2x2 grid (Персони / Локації / Організації / Терміни) -->
@@ -893,15 +917,16 @@ async function loadReach(days) {
     if (st.state === 'done') {
       applyReachData(st.data, days);
       const n = st.posts_total || 0;
-      setReachStatus(`Охоплення зібрано (постів: ${n})`, 'done');
+      if (st.sampled) {
+        const k = st.posts_sampled || 0;
+        setReachStatus(`Охоплення (≈ за вибіркою ${k} з ${n} постів)`, 'done');
+      } else {
+        setReachStatus(`Охоплення зібрано (постів: ${n})`, 'done');
+      }
       return;
     }
     if (st.state === 'error') {
-      let msg = st.error || 'unknown';
-      if (msg.startsWith('too_many_posts:')) {
-        const n = msg.split(':')[1];
-        msg = `Постів забагато (${n}). Звузьте запит або період.`;
-      }
+      const msg = st.error || 'unknown';
       setReachStatus('Не вдалось зібрати охоплення: ' + msg, 'error');
       return;
     }
@@ -1392,6 +1417,40 @@ _channel_list_lock = threading.Lock()
 _top_channels_cache: dict[tuple, tuple[float, list]] = {}
 _top_channels_lock = threading.Lock()
 
+# Alert-канали (БПЛА/тривоги/радари/ППО). Перечитуємо за mtime файлу,
+# рестарт dashboard після правок channels/alert_channels.txt не потрібен.
+_alert_channels_cache: tuple[float, set[str]] = (0.0, set())
+_alert_channels_lock = threading.Lock()
+
+
+def _load_alert_channels() -> set[str]:
+    """Lower-case alias-и alert-каналів. Кеш інвалідується по mtime файлу."""
+    global _alert_channels_cache
+    try:
+        mtime = ALERT_CHANNELS_FILE.stat().st_mtime
+    except OSError:
+        return set()
+
+    with _alert_channels_lock:
+        cached_mtime, cached_set = _alert_channels_cache
+        if cached_mtime == mtime:
+            return cached_set
+
+    aliases: set[str] = set()
+    try:
+        with open(ALERT_CHANNELS_FILE, encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                aliases.add(s.lower())
+    except OSError:
+        return set()
+
+    with _alert_channels_lock:
+        _alert_channels_cache = (mtime, aliases)
+    return aliases
+
 
 def get_channel_list(db) -> list[str]:
     global _channel_list_cache
@@ -1407,8 +1466,14 @@ def get_channel_list(db) -> list[str]:
     return data
 
 
-def get_top_channels(db, q: str, since_ts: str | None, until_ts: str | None) -> list:
-    key = (q, since_ts, until_ts)
+def get_top_channels(db, q: str, since_ts: str | None, until_ts: str | None,
+                     mode: str = "all") -> list:
+    """mode: 'all' — без розділення; 'main' — exclude alert; 'alert' — only alert."""
+    alert_aliases = _load_alert_channels() if mode != "all" else set()
+    if mode == "alert" and not alert_aliases:
+        return []
+
+    key = (q, since_ts, until_ts, mode)
     with _top_channels_lock:
         cached = _top_channels_cache.get(key)
         if cached and time.time() - cached[0] < _TOP_CHANNELS_TTL:
@@ -1424,14 +1489,27 @@ def get_top_channels(db, q: str, since_ts: str | None, until_ts: str | None) -> 
         if until_ts:
             tc_from += " AND messages.saved_at <= ?"
             params.append(until_ts)
-        sql = (f"SELECT messages.channel_title AS channel_title, "
-               f"       messages.channel_link  AS channel_link, "
-               f"       COUNT(*) AS cnt {tc_from} "
-               f"GROUP BY messages.channel_title ORDER BY cnt DESC LIMIT 20")
+        link_col = "messages.channel_link"
+        title_col = "messages.channel_title"
+        has_where = True
     else:
-        sql = ("SELECT channel_title, channel_link, COUNT(*) as cnt "
-               "FROM messages GROUP BY channel_title ORDER BY cnt DESC LIMIT 20")
+        tc_from = "FROM messages"
         params = []
+        link_col = "channel_link"
+        title_col = "channel_title"
+        has_where = False
+
+    if mode in ("main", "alert") and alert_aliases:
+        alert_links = [f"https://max.ru/{a}".lower() for a in alert_aliases]
+        ph = ",".join("?" * len(alert_links))
+        op = "NOT IN" if mode == "main" else "IN"
+        glue = "AND" if has_where else "WHERE"
+        tc_from += f" {glue} lower({link_col}) {op} ({ph})"
+        params.extend(alert_links)
+
+    sql = (f"SELECT {title_col} AS channel_title, {link_col} AS channel_link, "
+           f"       COUNT(*) AS cnt {tc_from} "
+           f"GROUP BY {title_col} ORDER BY cnt DESC LIMIT 20")
 
     try:
         rows = db.execute(sql, params).fetchall()
@@ -1472,7 +1550,9 @@ _timeline_lock = threading.Lock()
 # Глобальний семафор: одночасно лише один reach-task (login-токен MAX один).
 
 _REACH_CACHE_TTL = 900           # 15 хв
-_REACH_MAX_POSTS = 1000          # запобіжник: понад — відмова
+_REACH_FULL_LIMIT = 1500         # до цієї кількості постів — повний прохід
+_REACH_SAMPLE_SIZE = 800         # цільовий розмір вибірки понад FULL_LIMIT
+_REACH_HARD_LIMIT = 8000         # стеля SELECT — навіть без помилки, просто обрізаємо
 _REACH_ALLOWED_DAYS = (7, 30)    # 90 — занадто
 _REACH_TASK_TTL = 1800           # таски прибираємо через 30 хв
 
@@ -1492,14 +1572,39 @@ def _reach_gc():
             _reach_tasks.pop(tid, None)
 
 
+def _stratified_sample(
+    rows: list[dict], target: int
+) -> tuple[list[dict], dict[str, tuple[int, int]]]:
+    """Стратифікована вибірка: пропорційно по днях, мінімум до 5 постів на день
+    (якщо стільки взагалі є). Повертає (вибірка, {date: (day_total, day_sampled)})."""
+    by_day: dict[str, list[dict]] = {}
+    for r in rows:
+        by_day.setdefault(r["d"], []).append(r)
+
+    total = len(rows)
+    sampled_posts: list[dict] = []
+    day_meta: dict[str, tuple[int, int]] = {}
+    for d, day_rows in by_day.items():
+        proportional = round(len(day_rows) * target / total)
+        quota = max(min(5, len(day_rows)), proportional)
+        quota = min(len(day_rows), quota)
+        chunk = random.sample(day_rows, quota) if quota < len(day_rows) else list(day_rows)
+        sampled_posts.extend(chunk)
+        day_meta[d] = (len(day_rows), len(chunk))
+
+    return sampled_posts, day_meta
+
+
 def _run_reach_task(task_id: str, q: str, channel: str, days: int):
-    """Worker: SELECT матчених постів → fetch_views → агрегація по днях."""
+    """Worker: SELECT матчених постів → (опц. семплинг) → fetch_views → агрегація."""
     import views_fetcher
 
     task = _reach_tasks[task_id]
     try:
         db = get_db()
-        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_dt = datetime.now() - timedelta(days=days)
+        cutoff = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+        oldest_ts_ms = int(cutoff_dt.timestamp() * 1000)
         fts_q = build_fts_query(q)
         sql = ("SELECT messages.chat_id AS chat_id, messages.msg_id AS msg_id, "
                "       messages.msg_time AS msg_time, date(messages.saved_at) AS d "
@@ -1509,7 +1614,7 @@ def _run_reach_task(task_id: str, q: str, channel: str, days: int):
         if channel:
             sql += " AND messages.channel_title = ?"
             params.append(channel)
-        sql += f" ORDER BY messages.saved_at DESC LIMIT {_REACH_MAX_POSTS + 1}"
+        sql += f" ORDER BY messages.saved_at DESC LIMIT {_REACH_HARD_LIMIT}"
 
         try:
             rows = [dict(r) for r in db.execute(sql, params).fetchall()]
@@ -1519,17 +1624,18 @@ def _run_reach_task(task_id: str, q: str, channel: str, days: int):
         finally:
             db.close()
 
-        if len(rows) > _REACH_MAX_POSTS:
-            task.update(
-                state="error",
-                error=f"too_many_posts:{len(rows)}",
-                ts_done=time.time(),
-            )
+        if not rows:
+            task.update(state="done", data=[], ts_done=time.time(),
+                        posts_total=0, posts_sampled=0, sampled=False)
             return
 
-        if not rows:
-            task.update(state="done", data=[], ts_done=time.time())
-            return
+        posts_total = len(rows)
+        sampled_mode = posts_total > _REACH_FULL_LIMIT
+        if sampled_mode:
+            sampled_posts, day_meta = _stratified_sample(rows, _REACH_SAMPLE_SIZE)
+        else:
+            sampled_posts = rows
+            day_meta = {}
 
         # Прогрес з логів views_fetcher: "[views] N/M chat=..."
         progress_re = re.compile(r"\[views\]\s+(\d+)/(\d+)\s+chat=")
@@ -1541,36 +1647,44 @@ def _run_reach_task(task_id: str, q: str, channel: str, days: int):
                 task["progress"] = int(m.group(1))
                 task["total"] = int(m.group(2))
 
-        # Грубо: total = кількість унікальних каналів (буде уточнено першим логом)
-        task["total"] = len({r["chat_id"] for r in rows})
+        task["total"] = len({r["chat_id"] for r in sampled_posts})
         task["progress"] = 0
         task["state"] = "running"
 
         posts_for_views = [
             {"chat_id": r["chat_id"], "msg_id": r["msg_id"], "msg_time": r["msg_time"]}
-            for r in rows
+            for r in sampled_posts
         ]
-        views_map = views_fetcher.fetch_views(posts_for_views, log=log_capture)
+        views_map = views_fetcher.fetch_views(
+            posts_for_views, log=log_capture, oldest_ts_ms=oldest_ts_ms
+        )
 
-        # Агрегація по днях
-        sums: dict[str, int] = {}
-        for r in rows:
+        # Сума переглядів по днях у вибірці
+        sampled_sums: dict[str, int] = {}
+        for r in sampled_posts:
             v = views_map.get((r["chat_id"], str(r["msg_id"])))
             if isinstance(v, int):
-                sums[r["d"]] = sums.get(r["d"], 0) + v
+                sampled_sums[r["d"]] = sampled_sums.get(r["d"], 0) + v
 
         today = datetime.now().date()
         result = []
         for i in range(days - 1, -1, -1):
             d = (today - timedelta(days=i)).isoformat()
-            result.append({"date": d, "views": sums.get(d, 0)})
+            sv = sampled_sums.get(d, 0)
+            if sampled_mode and d in day_meta:
+                day_total, day_sampled = day_meta[d]
+                views_d = round(sv * day_total / day_sampled) if day_sampled > 0 else 0
+            else:
+                views_d = sv
+            result.append({"date": d, "views": views_d})
 
         cache_key = (q, channel, days)
         with _reach_lock:
             _reach_cache[cache_key] = (time.time(), result)
 
         task.update(state="done", data=result, ts_done=time.time(),
-                    posts_total=len(rows))
+                    posts_total=posts_total, posts_sampled=len(sampled_posts),
+                    sampled=sampled_mode)
     except Exception as e:
         task.update(state="error", error=f"exception: {e}", ts_done=time.time())
     finally:
@@ -1957,6 +2071,8 @@ def api_timeline_reach_status(task_id: str):
     if task["state"] == "done":
         out["data"] = task["data"]
         out["posts_total"] = task.get("posts_total", 0)
+        out["posts_sampled"] = task.get("posts_sampled", 0)
+        out["sampled"] = task.get("sampled", False)
     elif task["state"] == "error":
         out["error"] = task.get("error", "unknown")
     return jsonify(out)
@@ -2221,9 +2337,14 @@ def index():
     # Список каналів для фільтру (TTL 300с — рідко змінюється)
     channel_list = get_channel_list(db)
 
-    # Топ каналів: якщо є q — серед матчених, інакше глобальний.
-    # Час враховуємо, щоб top відповідав поточному вікну фільтрів (TTL 60с).
-    top_channels = get_top_channels(db, q, since_ts, until_ts)
+    # Топ каналів: при пошуку — один список серед матчених; без q — два списки
+    # (основний потік + alert-канали з channels/alert_channels.txt). TTL 60с.
+    if q:
+        top_channels = get_top_channels(db, q, since_ts, until_ts, mode="all")
+        top_channels_alert = None
+    else:
+        top_channels = get_top_channels(db, q, since_ts, until_ts, mode="main")
+        top_channels_alert = get_top_channels(db, q, since_ts, until_ts, mode="alert")
 
     # Топ слів (з урахуванням обраного каналу)
     top_words = get_top_words(db, words_period, channel)
@@ -2250,6 +2371,7 @@ def index():
         q=q, channel=channel, page=page,
         total_count=total_count, total_pages=total_pages,
         channel_list=channel_list, top_channels=top_channels,
+        top_channels_alert=top_channels_alert,
         top_words=top_words, words_period=words_period,
         nlp_ready=nlp_mod.nlp_available(),
         period=period, from_date=from_date, to_date=to_date, sort=sort,

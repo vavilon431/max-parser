@@ -3,6 +3,42 @@
 
 ---
 
+## [2026-05-04 10:30] — v3.6: Reach без жорсткого ліміту + alert-секція в Топ каналів
+
+**Ключові зміни:**
+
+Reach-pipeline ([views_fetcher.py](../views_fetcher.py), [dashboard.py](../dashboard.py)):
+- `CONCURRENT_CHATS` 5 → 24. Pipelining op=49 у тому самому WS-conn — websockets дозволяє багато паралельних send (recv-loop один). Звірено через context7-доки `python-websockets`. Окремі conn-и не відкриваємо (MAX блокує паралельні сесії на токен).
+- In-memory кеш `(chat_id, msg_id) → (views, ts)` у `views_fetcher` з TTL 30 хв (`_views_cache`, `_cache_get`, `_cache_put`). Перемикання період 7↔30 не фетчить ті самі пости повторно.
+- `_fetch_one_chat` отримав `oldest_ts_ms` — пагінація припиняється коли `cursor` перетнув нижню межу періоду. Скорочує MAX_ROUNDS_PER_CHAT на сухих каналах.
+- Прибрано hard-fail `too_many_posts:1001` ([dashboard.py:1495-1577](../dashboard.py)). Замість нього — стратифіковане семплування:
+  - `_REACH_FULL_LIMIT = 1500` — повний прохід
+  - `_REACH_SAMPLE_SIZE = 800` — цільова вибірка понад FULL_LIMIT
+  - `_REACH_HARD_LIMIT = 8000` — стеля SELECT
+  - Helper `_stratified_sample(rows, target)` — пропорційна квота по днях, мін. 5 постів на день. Екстраполяція `views_d = sampled × (day_total/day_sampled)`.
+- API `/api/timeline-reach/<task_id>` тепер повертає `sampled`, `posts_total`, `posts_sampled`. Inline JS показує `Охоплення (≈ за вибіркою K з N постів)` для семплованого режиму.
+- Деплой-смок: `q=путин&days=7` (раніше падав 1001) → 3418 постів → семпл 799 → 394 канали за ~60с. Реалістичні views: 28.04: 32.7М, 29.04: 44.2М, 30.04: 39М. CONCURRENT_CHATS=24 без rate-limit на токен.
+
+Alert-канали — двосекційний Топ каналів ([dashboard.py](../dashboard.py)):
+- Новий файл [channels/alert_channels.txt](../channels/alert_channels.txt) — alias по рядку, lower-case, mtime-кеш в `_load_alert_channels()` (рестарт dashboard не потрібен при правці файлу).
+- `get_top_channels(..., mode)` — режими `'all'` (поточна поведінка), `'main'` (exclude alert), `'alert'` (only alert). Фільтр `lower(channel_link) IN/NOT IN (?,?,...)`. Ключ кешу включає `mode`.
+- Без `q` → два списки в `tops-grid`: «Топ каналів — основний потік» + «Топ каналів — БПЛА / тривоги / радари». З `q` → один список як раніше.
+- CSS `.tops-grid` оновлено на `repeat(auto-fit, minmax(380px, 1fr))` — один блок full-width, два = 50/50 на широких, 1 колонка на mobile.
+- Seed-список з 27 alert-каналів (`LPRalarm`, `Info_bpla_Shebekino`, `vrv_radar`, `radarrussiia_novosti`, `crimea_radar82`, `locatorru`, `russia_rradar`, `BelgorodDRONE`, `krnew`, `kerch_onlinee` тощо).
+
+Обслуговування каналів:
+- Видалено канал «Плохие скидки» (alias `plohie_skidki`) — з `channels.txt`, з VPS `resolved.json` (3756 → 3755 каналів, бекап лежить на VPS), 787 постів видалено з `messages` + `INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`. `max-parser` зупинявся на ~5с (інакше DB locked), знову active.
+
+**Підводні камені, які зафіксовано:**
+- `get_top_channels` групує `GROUP BY channel_title` — два канали з однаковою назвою (наприклад `russia_rradar` + `kerch_onlinee` обидва "Радар по всей России") **зливаються в одну стрічку UI**. Це не баг від цих змін (поведінка існуюча), але видно гостро коли користувач переносить дублікат у alert. Кандидат на наступну ітерацію: `GROUP BY channel_link` або композитний ключ.
+- `LIMIT 20` ріже хвіст alert-режиму. З 25+ alert-каналів зараз 5 випадають з top-20 (cnt < 24). Якщо буде запит — підняти LIMIT для alert-режиму до 30.
+
+**Поточний стан:** v3.6 деплоєна. `max-dashboard` active, `max-parser` active (3755 каналів). Reach-смок: «путин/7д» працює без помилки. Двосекційний топ виводиться при порожньому `q`.
+
+**Наступний крок:** Завершити WS-рефакторинг із попереднього стейджа (`ws_common.py` + правки `ws_parser.py`/`resolve_channels.py`/`views_fetcher.py` що поза reach-блоком) — це окремий незакомічений шар з v3.5. Окремо: оцінити чи варто змінити `GROUP BY channel_title` → `channel_link` у топ каналів, щоб дублікати назви не зливалися.
+
+---
+
 ## [2026-05-04 08:37] — v3.5: Кнопка «📄 Звіт» — PDF-експорт дашборду на клієнті
 
 **Ключові зміни:**

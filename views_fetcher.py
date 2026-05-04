@@ -8,21 +8,45 @@ Live view-count fetcher для експорту xlsx.
 
 import asyncio
 import json
+import threading
 import time
 from datetime import datetime
-from pathlib import Path
 
 import websockets
 
-WS_URL = "wss://ws-api.oneme.ru/websocket"
-ROOT = Path(__file__).parent
-LOGIN_TOKEN_FILE = ROOT / ".login_token"
-DEVICE_ID_FILE = ROOT / ".device_id"
+from ws_common import (
+    WS_URL, WS_HEADERS, get_device_id, get_login_token,
+    handshake_payload, make_msg,
+)
 
 MAX_PER_REQUEST     = 100   # backward cap для op=49
 MAX_ROUNDS_PER_CHAT = 20    # запобіжник pagination на канал
 WS_TIMEOUT          = 10
-INTER_REQUEST_DELAY = 0.05  # rate-limit hygiene (на окремому WS-conn, не на парсерному)
+INTER_REQUEST_DELAY = 0.02  # rate-limit hygiene між op=49 у межах одного chat
+CONCURRENT_CHATS    = 24    # pipelining у тому самому WS-conn: websockets дозволяє
+                            # багато паралельних send (recv-loop один). Окремі
+                            # conn-и не відкриваємо — MAX блокує паралельні сесії
+                            # на той самий токен. Підняли з 5 для прискорення reach.
+
+# In-memory кеш `(chat_id, msg_id) -> (views, ts)`. Views ростуть повільно,
+# 30-хв застаріння для UI прийнятне; зекономлює op=49 при перемиканнях період/канал.
+_VIEWS_CACHE_TTL = 1800
+_views_cache: dict[tuple[int, str], tuple[int, float]] = {}
+_views_cache_lock = threading.Lock()
+
+
+def _cache_get(chat_id: int, msg_id: str) -> int | None:
+    now = time.time()
+    with _views_cache_lock:
+        entry = _views_cache.get((chat_id, msg_id))
+        if entry and now - entry[1] < _VIEWS_CACHE_TTL:
+            return entry[0]
+    return None
+
+
+def _cache_put(chat_id: int, msg_id: str, views: int) -> None:
+    with _views_cache_lock:
+        _views_cache[(chat_id, msg_id)] = (views, time.time())
 
 
 def _parse_msg_time_ms(s: str) -> int:
@@ -41,14 +65,8 @@ def _parse_msg_time_ms(s: str) -> int:
 
 class _Client:
     def __init__(self):
-        if not LOGIN_TOKEN_FILE.exists():
-            raise RuntimeError(f"нема {LOGIN_TOKEN_FILE}")
-        self._token = LOGIN_TOKEN_FILE.read_text().strip()
-        if DEVICE_ID_FILE.exists():
-            self._device_id = DEVICE_ID_FILE.read_text().strip()
-        else:
-            self._device_id = f"web_{int(time.time())}"
-            DEVICE_ID_FILE.write_text(self._device_id)
+        self._token = get_login_token(strict=False)
+        self._device_id = get_device_id()
         self._seq = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._ws = None
@@ -79,10 +97,9 @@ class _Client:
 
     async def send_op(self, opcode: int, payload: dict, timeout: float = WS_TIMEOUT):
         s = self._ns()
-        msg = json.dumps({"ver": 11, "cmd": 0, "seq": s, "opcode": opcode, "payload": payload}, ensure_ascii=False)
         fut = asyncio.get_running_loop().create_future()
         self._pending[s] = fut
-        await self._ws.send(msg)
+        await self._ws.send(make_msg(s, opcode, payload))
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
@@ -90,22 +107,9 @@ class _Client:
             return None
 
     async def connect(self):
-        headers = {
-            "Origin": "https://web.max.ru",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-        }
-        self._ws = await websockets.connect(WS_URL, additional_headers=headers, ping_interval=30)
+        self._ws = await websockets.connect(WS_URL, additional_headers=WS_HEADERS, ping_interval=30)
         self._recv_task = asyncio.create_task(self._recv_loop())
-        hs = await self.send_op(6, {
-            "deviceId": self._device_id,
-            "userAgent": {
-                "deviceType": "WEB", "locale": "ru", "deviceLocale": "ru",
-                "osVersion": "Windows 10", "deviceName": "Chrome",
-                "headerUserAgent": "Mozilla/5.0",
-                "appVersion": "1.0.0", "screen": "1920x1080", "timezone": "Europe/Moscow",
-            },
-        })
+        hs = await self.send_op(6, handshake_payload(self._device_id))
         if not hs or hs.get("cmd") == 3:
             raise RuntimeError(f"handshake fail: {hs}")
         login = await self.send_op(19, {"token": self._token}, timeout=15)
@@ -123,14 +127,19 @@ class _Client:
 
 
 async def _fetch_one_chat(client: _Client, chat_id: int,
-                          want_msg_ids: set[str], newest_ts_ms: int) -> dict[str, int]:
-    """Повертає {msg_id: views} для запитаних msg_ids у межах одного каналу."""
+                          want_msg_ids: set[str], newest_ts_ms: int,
+                          oldest_ts_ms: int = 0) -> dict[str, int]:
+    """Повертає {msg_id: views} для запитаних msg_ids у межах одного каналу.
+    oldest_ts_ms — нижня межа періоду пошуку; пагінація глибше вже не дасть
+    нових матчів, тож раніше виходимо."""
     out: dict[str, int] = {}
     remaining = set(want_msg_ids)
     cursor = newest_ts_ms + 60_000  # +60с буфер на випадок розбіжності timestamps
 
     for _ in range(MAX_ROUNDS_PER_CHAT):
         if not remaining:
+            break
+        if oldest_ts_ms and cursor < oldest_ts_ms:
             break
         resp = await client.send_op(49, {
             "chatId": chat_id, "from": cursor,
@@ -158,41 +167,68 @@ async def _fetch_one_chat(client: _Client, chat_id: int,
     return out
 
 
-async def _fetch_views_async(posts: list[dict], log) -> dict[tuple[int, str], int | None]:
+async def _fetch_views_async(posts: list[dict], log,
+                             oldest_ts_ms: int = 0) -> dict[tuple[int, str], int | None]:
     if not posts:
         return {}
+
+    # 1. Кеш-хіти забираємо одразу — не відкриваючи WS-сесію.
+    result: dict[tuple[int, str], int | None] = {}
+    posts_to_fetch: list[dict] = []
+    for p in posts:
+        key = (p["chat_id"], str(p["msg_id"]))
+        cached = _cache_get(p["chat_id"], str(p["msg_id"]))
+        if cached is not None:
+            result[key] = cached
+        else:
+            result[key] = None
+            posts_to_fetch.append(p)
+
+    cached_n = len(posts) - len(posts_to_fetch)
+    if cached_n:
+        log(f"[views] cache hit {cached_n}/{len(posts)}")
+
+    if not posts_to_fetch:
+        return result
+
     client = _Client()
     await client.connect()
-    log(f"[views] WS connected, постів={len(posts)}")
+    log(f"[views] WS connected, постів={len(posts_to_fetch)}, concurrent={CONCURRENT_CHATS}")
     try:
         by_chat: dict[int, list[dict]] = {}
-        for p in posts:
+        for p in posts_to_fetch:
             by_chat.setdefault(p["chat_id"], []).append(p)
 
-        result: dict[tuple[int, str], int | None] = {
-            (p["chat_id"], str(p["msg_id"])): None for p in posts
-        }
+        total = len(by_chat)
+        progress = {"done": 0}
+        sem = asyncio.Semaphore(CONCURRENT_CHATS)
 
-        for i, (chat_id, items) in enumerate(by_chat.items(), 1):
+        async def _process(chat_id: int, items: list[dict]):
             want = {str(p["msg_id"]) for p in items}
             newest_ts = max(_parse_msg_time_ms(p["msg_time"]) for p in items)
-            try:
-                got = await _fetch_one_chat(client, chat_id, want, newest_ts)
-            except Exception as e:
-                log(f"[views] chat={chat_id} помилка: {e}")
-                got = {}
+            async with sem:
+                try:
+                    got = await _fetch_one_chat(client, chat_id, want, newest_ts, oldest_ts_ms)
+                except Exception as e:
+                    log(f"[views] chat={chat_id} помилка: {e}")
+                    got = {}
             for mid, v in got.items():
                 result[(chat_id, mid)] = v
-            log(f"[views] {i}/{len(by_chat)} chat={chat_id} got {len(got)}/{len(want)}")
+                _cache_put(chat_id, mid, v)
+            progress["done"] += 1
+            log(f"[views] {progress['done']}/{total} chat={chat_id} got {len(got)}/{len(want)}")
 
+        await asyncio.gather(*(_process(c, items) for c, items in by_chat.items()))
         return result
     finally:
         await client.close()
 
 
-def fetch_views(posts: list[dict], log=print) -> dict[tuple[int, str], int | None]:
+def fetch_views(posts: list[dict], log=print,
+                oldest_ts_ms: int = 0) -> dict[tuple[int, str], int | None]:
     """
     Sync wrapper. posts — список dict-ів з ключами chat_id, msg_id, msg_time.
+    oldest_ts_ms — нижня межа періоду в мс епохи; pagination не йде глибше.
     Повертає {(chat_id, msg_id_str): views | None}.
     """
-    return asyncio.run(_fetch_views_async(posts, log=log))
+    return asyncio.run(_fetch_views_async(posts, log=log, oldest_ts_ms=oldest_ts_ms))
