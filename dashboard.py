@@ -80,6 +80,44 @@ TEMPLATE = """
     :root { --page-max: 1400px; --page-pad: 1.25rem; }
     body { background: #080b14; color: #c9d1d9; font-family: 'Inter', sans-serif; min-height: 100vh; }
 
+    /* ── PDF-режим: інверсна тема для друку ───────────────────────────────── */
+    body.pdf-mode { background: #ffffff !important; color: #000 !important; }
+    body.pdf-mode::before { display: none !important; }
+    body.pdf-mode, body.pdf-mode * {
+      color: #000 !important;
+      border-color: #cccccc !important;
+    }
+    body.pdf-mode #report-root,
+    body.pdf-mode #pdf-report-header,
+    body.pdf-mode .search-wrap,
+    body.pdf-mode .result-badge,
+    body.pdf-mode .timeline-card,
+    body.pdf-mode .analytics-result,
+    body.pdf-mode .stat-card,
+    body.pdf-mode .topic-card,
+    body.pdf-mode .sidebar-card,
+    body.pdf-mode .post-card {
+      background: #ffffff !important;
+      background-image: none !important;
+    }
+    body.pdf-mode .timeline-reach-total {
+      background: #f0fafe !important;
+      border-color: #abdfee !important;
+    }
+    body.pdf-mode .word-bar-track,
+    body.pdf-mode .channel-bar-track {
+      background: #eeeeee !important;
+    }
+    body.pdf-mode strong { color: #000 !important; }
+    body.pdf-mode mark.highlight { background: #fff59d !important; color: #000 !important; }
+    body.pdf-mode .analytics-body .ai-list-item {
+      background: #f6f5ff !important; border-left-color: #6c63ff !important;
+    }
+    body.pdf-mode .analytics-body h3 { color: #000 !important; border-bottom-color: #ccc !important; }
+    body.pdf-mode .topics-title strong,
+    body.pdf-mode .timeline-title strong,
+    body.pdf-mode .channel-name { color: #000 !important; }
+
     /* Фон з градієнтом */
     body::before {
       content: ''; position: fixed; inset: 0; z-index: -1;
@@ -113,6 +151,7 @@ TEMPLATE = """
       background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07);
       border-radius: 14px; padding: 1.25rem 1.5rem;
       transition: transform 0.2s, border-color 0.2s;
+      text-align: center;
     }
     .stat-card:hover { transform: translateY(-2px); border-color: rgba(108,99,255,0.4); }
     .stat-icon { font-size: 1.4rem; margin-bottom: 0.5rem; }
@@ -1041,7 +1080,10 @@ const pointValueLabelsPlugin = {
         return v >= l && v >= r;
       };
       const fmt = isReach ? fmtBigUA : (v) => String(v);
-      ctx.fillStyle = isReach ? '#90e0ef' : '#c4bfff';
+      const isPdf = document.body.classList.contains('pdf-mode');
+      ctx.fillStyle = isPdf
+        ? (isReach ? '#0c7588' : '#3a2db8')
+        : (isReach ? '#90e0ef' : '#c4bfff');
       ctx.textBaseline = isReach ? 'top' : 'bottom';
       const minStep = isReach ? 38 : 28;
       let lastDrawX = -Infinity;
@@ -1428,25 +1470,48 @@ async function generatePDF(btn) {
   const header = document.createElement('div');
   header.id = 'pdf-report-header';
   header.style.cssText =
-    'background:#080b14;color:#e2e8f0;padding:1.5rem 2rem 1rem;margin-bottom:1rem;' +
-    'border-bottom:2px solid rgba(108,99,255,0.4);text-align:center;' +
+    'background:#ffffff;color:#000;padding:1.5rem 2rem 1rem;margin-bottom:1rem;' +
+    'border-bottom:2px solid #6c63ff;text-align:center;' +
     'font-family:system-ui,sans-serif;';
   const subParts = [];
   if (q) subParts.push(`по ключовому слову «${q}»`);
   if (periodLabel) subParts.push(periodLabel + (periodDates ? ` (${periodDates})` : ''));
   header.innerHTML =
-    '<div style="font-size:1.3rem;font-weight:800;color:#c4bfff;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:.4rem;">' +
+    '<div style="font-size:1.3rem;font-weight:800;color:#000;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:.4rem;">' +
       'МОНІТОРИНГ МЕДІА-ПРОСТОРУ МЕСЕНДЖЕРА «MAX»' +
     '</div>' +
-    '<div style="font-size:1rem;font-weight:600;color:#e2e8f0;">' +
+    '<div style="font-size:1rem;font-weight:600;color:#000;">' +
       'Звіт ' + (subParts.length ? subParts.join(' · ') : '— загальний') +
     '</div>';
   root.insertBefore(header, root.firstChild);
 
+  // Перемикаємо у світлу тему для PDF
+  document.body.classList.add('pdf-mode');
+
+  // Патч Chart.js: темні axis-кольори → чорні, grid-лінії → світло-сірі
+  let chartPatch = null;
+  if (typeof timelineChart !== 'undefined' && timelineChart) {
+    const sx = timelineChart.options.scales.x;
+    const sy = timelineChart.options.scales.y;
+    const sr = timelineChart.options.scales.yReach;
+    const lg = timelineChart.options.plugins && timelineChart.options.plugins.legend;
+    chartPatch = {
+      x_t: sx.ticks.color, x_g: sx.grid.color,
+      y_t: sy.ticks.color, y_g: sy.grid.color,
+      r_t: sr ? sr.ticks.color : null,
+      l_c: lg && lg.labels ? lg.labels.color : null,
+    };
+    sx.ticks.color = '#000'; sx.grid.color = '#dddddd';
+    sy.ticks.color = '#000'; sy.grid.color = '#dddddd';
+    if (sr) sr.ticks.color = '#000';
+    if (lg && lg.labels) lg.labels.color = '#000';
+    timelineChart.update('none');
+  }
+
   try {
     const canvas = await html2canvas(root, {
       scale: 2,
-      backgroundColor: '#080b14',
+      backgroundColor: '#ffffff',
       useCORS: true,
       logging: false,
       windowWidth: root.scrollWidth,
@@ -1495,6 +1560,20 @@ async function generatePDF(btn) {
     // Прибираємо тимчасовий заголовок — у будь-якому разі
     const h = document.getElementById('pdf-report-header');
     if (h) h.remove();
+    // Знімаємо PDF-режим
+    document.body.classList.remove('pdf-mode');
+    // Відновлюємо кольори графіка
+    if (chartPatch && typeof timelineChart !== 'undefined' && timelineChart) {
+      const sx = timelineChart.options.scales.x;
+      const sy = timelineChart.options.scales.y;
+      const sr = timelineChart.options.scales.yReach;
+      const lg = timelineChart.options.plugins && timelineChart.options.plugins.legend;
+      sx.ticks.color = chartPatch.x_t; sx.grid.color = chartPatch.x_g;
+      sy.ticks.color = chartPatch.y_t; sy.grid.color = chartPatch.y_g;
+      if (sr && chartPatch.r_t) sr.ticks.color = chartPatch.r_t;
+      if (lg && lg.labels && chartPatch.l_c) lg.labels.color = chartPatch.l_c;
+      timelineChart.update('none');
+    }
     btn.disabled = false;
     btn.textContent = origText;
   }
