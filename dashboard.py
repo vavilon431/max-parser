@@ -29,11 +29,25 @@ import uuid
 DB_FILE                   = Path(__file__).parent / "matches.db"
 CUSTOM_STOPS_FILE         = Path(__file__).parent / "custom_stop_words.txt"
 ALERT_CHANNELS_FILE       = Path(__file__).parent / "channels" / "alert_channels.txt"
-TOP_WORDS_CACHE_TTL       = 300
+TOP_WORDS_CACHE_TTL       = 3600   # 1 год — прорахунок на 20k постів коштує дорого
 BASELINE_REBUILD_INTERVAL = 24 * 3600
-# NER+syntax pipeline ~30-60ms/пост → обмежуємо вибірку щоб первинний прорахунок
-# не блокував UI довше за хвилину. Кеш TTL=300с покриває наступні запити.
-MAX_ROWS_SCAN             = 3_000
+# NER+syntax pipeline ~30-60ms/пост → перший прорахунок ~10-20 хв на 20k постах,
+# тому API повертає миттєво (кеш або порожньо + фоновий тред), JS перепитує.
+MAX_ROWS_SCAN             = 20_000
+
+# AI-аналітика через Claude API
+ANTHROPIC_KEY_FILE        = Path(__file__).parent / ".anthropic_key"
+# Опційний base_url для проксі (Cloudflare AI Gateway / LiteLLM) — потрібен через
+# гео-блок Anthropic у RU. Формат: https://gateway.ai.cloudflare.com/v1/<acct>/<gw>/anthropic
+ANTHROPIC_GATEWAY_FILE    = Path(__file__).parent / ".anthropic_gateway"
+# Опційний токен для Authenticated Gateway (cf-aig-authorization)
+ANTHROPIC_GATEWAY_TOKEN_FILE = Path(__file__).parent / ".anthropic_gateway_token"
+ANTHROPIC_MODEL           = "claude-sonnet-4-6"
+SUMMARY_PROMPT_FILE       = Path(__file__).parent / "summary.txt"
+ANALYTICS_MAX_INPUT_CHARS = 600_000   # ~150k токенів — безпечний поріг для context 200k
+ANALYTICS_POST_TRIM_CHARS = 1_500     # обрізання дуже довгих постів
+ANALYTICS_TASK_TTL        = 1800      # 30 хв
+ANALYTICS_CACHE_TTL       = 900       # 15 хв на (q, channel, since_ts, until_ts)
 
 _top_words_cache: dict[tuple[str, str], tuple[float, dict]] = {}
 _top_words_inflight: set[tuple[str, str]] = set()  # (period, channel) пари в обчисленні
@@ -63,7 +77,7 @@ TEMPLATE = """
   <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js" defer></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; }
-    :root { --page-max: 1400px; --page-pad: 1.5rem; }
+    :root { --page-max: 1400px; --page-pad: 1.25rem; }
     body { background: #080b14; color: #c9d1d9; font-family: 'Inter', sans-serif; min-height: 100vh; }
 
     /* Фон з градієнтом */
@@ -92,7 +106,7 @@ TEMPLATE = """
     /* Stat cards */
     .stat-grid {
       display: grid; grid-template-columns: repeat(4,1fr); gap: 1rem;
-      max-width: var(--page-max); margin: 1.5rem auto; padding: 0 var(--page-pad);
+      max-width: var(--page-max); margin: 1.5rem auto;
     }
     @media(max-width:768px){ .stat-grid { grid-template-columns: repeat(2,1fr); } }
     .stat-card {
@@ -108,12 +122,12 @@ TEMPLATE = """
     /* Tops row (Топ каналів). Один список — повна ширина, два — 50/50 на широких. */
     .tops-grid {
       display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 1rem;
-      max-width: var(--page-max); margin: 0 auto 1rem; padding: 0 var(--page-pad);
+      max-width: var(--page-max); margin: 0 auto 1rem;
     }
 
     /* Topics analytics: 2x2 grid категорій (Персони/Локації/Організації/Терміни) */
     .topics-section {
-      max-width: var(--page-max); margin: 0 auto 1.5rem; padding: 0 var(--page-pad);
+      max-width: var(--page-max); margin: 0 auto 1.5rem;
     }
     .topics-head {
       display: flex; justify-content: space-between; align-items: center;
@@ -140,8 +154,6 @@ TEMPLATE = """
       background: rgba(255,255,255,0.04); padding: 2px 8px; border-radius: 999px; }
     .topic-list {
       display: flex; flex-direction: column; gap: 0.35rem;
-      max-height: 380px; overflow-y: auto; padding-right: 6px;
-      scrollbar-gutter: stable;
     }
     .topic-empty { font-size: 0.78rem; color: #3d4a5c; text-align: center;
       padding: 1.5rem 0.5rem; font-style: italic; }
@@ -158,10 +170,47 @@ TEMPLATE = """
     .topic-card[data-cat="term"] .word-row-link:hover { color: #82e0a8; }
     .topic-card[data-cat="term"] .word-bar-fill { background: linear-gradient(90deg, #50c878, #82e0a8); }
 
+    /* AI-аналітика (контейнер замість стрічки постів) */
+    .analytics-result {
+      max-width: var(--page-max); margin: 0 auto 1.5rem; padding: 1.25rem;
+      background: linear-gradient(135deg, rgba(108,99,255,0.08), rgba(139,131,255,0.04));
+      border: 1px solid rgba(108,99,255,0.25); border-radius: 14px;
+    }
+    .analytics-head {
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 0.75rem; gap: 0.75rem;
+    }
+    .analytics-title { font-size: 1.05rem; font-weight: 700; color: #c4bfff; }
+    .analytics-title span { color: #ffd7a8; }
+    .analytics-close {
+      background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+      color: #c4bfff; border-radius: 8px; padding: 4px 10px; cursor: pointer;
+      font-size: 0.85rem; transition: all 0.15s;
+    }
+    .analytics-close:hover { background: rgba(255,255,255,0.1); color: #fff; }
+    .analytics-meta {
+      font-size: 0.78rem; color: #8b83a8; margin-bottom: 1rem;
+      padding-bottom: 0.6rem; border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+    .analytics-body { font-size: 0.92rem; line-height: 1.55; color: #e2e0ff; }
+    .analytics-body h3 {
+      font-size: 1rem; font-weight: 700; color: #ffb86c;
+      margin: 1rem 0 0.5rem; padding-bottom: 0.3rem;
+      border-bottom: 1px solid rgba(255,184,108,0.2);
+    }
+    .analytics-body h3:first-child { margin-top: 0; }
+    .analytics-body p { margin: 0.5rem 0; }
+    .analytics-body strong { color: #c4bfff; font-weight: 600; }
+    .analytics-body .ai-list-item {
+      margin: 0.4rem 0; padding: 0.5rem 0.75rem;
+      background: rgba(255,255,255,0.025); border-left: 3px solid #6c63ff;
+      border-radius: 6px;
+    }
+
     /* Main layout */
     .main-grid {
       display: grid; grid-template-columns: 1fr; gap: 1.5rem;
-      max-width: var(--page-max); margin: 0 auto; padding: 0 var(--page-pad) 2rem;
+      max-width: var(--page-max); margin: 0 auto; padding: 0 0 2rem;
     }
 
     /* Search bar */
@@ -266,6 +315,10 @@ TEMPLATE = """
       border-radius: 14px; padding: 1rem 1.25rem; margin-bottom: 1rem;
     }
     .timeline-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; flex-wrap: wrap; gap: 0.5rem; }
+    .timeline-reach-total { font-size: 0.78rem; font-weight: 500; color: #56cfe1;
+      margin-left: 0.5rem; padding: 2px 8px; background: rgba(86,207,225,0.08);
+      border: 1px solid rgba(86,207,225,0.25); border-radius: 999px; }
+    .timeline-reach-total:empty { display: none; }
     .timeline-title { font-size: 0.85rem; color: #8b83ff; font-weight: 600; }
     .timeline-title strong { color: #c4bfff; }
     .timeline-tabs { display: flex; gap: 4px; }
@@ -473,8 +526,13 @@ TEMPLATE = """
       <option value="old" {% if sort=='old' %}selected{% endif %}>Спочатку старі</option>
     </select>
     <button type="submit" class="btn-search">Знайти</button>
-    <button type="submit" class="btn-search" formaction="/api/export-xlsx"
+    <button type="button" class="btn-search" id="export-xlsx-btn"
             title="Завантажити поточну вибірку в .xlsx (актуальна кількість переглядів збирається з MAX на момент завантаження)">📥 Завантажити</button>
+    {% set _analytics_ok = q and period in ['24h', '7d'] %}
+    <button type="button" class="btn-search" id="analytics-btn"
+            {% if not _analytics_ok %}disabled
+              title="{% if not q %}Доступно лише при пошуку по ключовому слову{% else %}Доступно лише для періодів «Доба» або «Тиждень»{% endif %}"
+            {% else %}title="Запустити AI-аналіз постів через Claude (5-30 с)"{% endif %}>🧠 Аналітика</button>
     <button type="button" class="btn-search" onclick="generatePDF(this)"
             title="Сформувати PDF-звіт того, що зараз на дашборді">📄 Звіт</button>
     {% if q or channel or period != '24h' %}<a href="/" class="btn-clear" title="Скинути фільтри">✕</a>{% endif %}
@@ -491,7 +549,7 @@ TEMPLATE = """
   <div class="result-badge-meta">
     {% if q %}для запиту <strong>«{{ q }}»</strong>{% endif %}
     {% if channel %}{% if q %}·{% endif %} канал <strong>{{ channel }}</strong>{% endif %}
-    {% if period_label %}{% if q or channel %}·{% endif %} {{ period_label }}{% endif %}
+    {% if period_label %}{% if q or channel %}·{% endif %} {{ period_label }}{% if period_dates %} ({{ period_dates }}){% endif %}{% endif %}
   </div>
   {% if sparkline_svg %}<div class="result-badge-sparkline">{{ sparkline_svg | safe }}</div>{% endif %}
 </div>
@@ -502,6 +560,7 @@ TEMPLATE = """
   <div class="timeline-head">
     <div class="timeline-title">
       Динаміка згадок{% if q %} <strong>«{{ q }}»</strong>{% endif %}{% if channel %} · {{ channel }}{% endif %}
+      <span id="timeline-reach-total" class="timeline-reach-total"></span>
     </div>
     <div class="timeline-tabs">
       <button type="button" class="timeline-tab" data-days="7">7 днів</button>
@@ -516,7 +575,7 @@ TEMPLATE = """
 <!-- Tops row: Топ каналів. Без q — два списки (основний + alert), з q — один. -->
 <div class="tops-grid">
   <div class="sidebar-card">
-    <div class="sidebar-title">{% if top_channels_alert is not none %}Топ каналів — основний потік{% else %}Топ каналів{% endif %}</div>
+    <div class="sidebar-title">{% if top_channels_alert is not none %}Топ каналів — основний потік{% else %}Топ каналів{% endif %} ({{ top_channels_total }})</div>
     {% set max_cnt = top_channels[0].cnt if top_channels else 1 %}
     {% for ch in top_channels %}
     {% set display_name = ch.channel_title if ch.channel_title and not ch.channel_title.lstrip('-').isdigit() else ch.channel_link.split('/')[-1] %}
@@ -533,7 +592,7 @@ TEMPLATE = """
   </div>
   {% if top_channels_alert is not none %}
   <div class="sidebar-card">
-    <div class="sidebar-title">Топ каналів — БПЛА / тривоги / радари</div>
+    <div class="sidebar-title">Топ каналів — БПЛА / тривоги / радари ({{ top_channels_alert_total }})</div>
     {% if top_channels_alert %}
     {% set max_cnt_alert = top_channels_alert[0].cnt %}
     {% for ch in top_channels_alert %}
@@ -559,12 +618,7 @@ TEMPLATE = """
 <div class="topics-section" data-channel="{{ channel }}">
   <div class="topics-head">
     <div class="topics-title">
-      Тематична аналітика — <strong>військово-політична</strong>{% if channel %} · канал <strong>{{ channel }}</strong>{% endif %}
-    </div>
-    <div class="period-tabs" style="margin-bottom:0;">
-      <button onclick="loadTopWords('day')"   class="period-tab" data-period="day">День</button>
-      <button onclick="loadTopWords('week')"  class="period-tab" data-period="week">Тиждень</button>
-      <button onclick="loadTopWords('month')" class="period-tab" data-period="month">Місяць</button>
+      Тематична аналітика{% if words_period_label %} {{ words_period_label }}{% endif %} — <strong>військово-політична</strong>{% if channel %} · канал <strong>{{ channel }}</strong>{% endif %}
     </div>
   </div>
   <div class="topics-grid">
@@ -607,8 +661,19 @@ TEMPLATE = """
   </div>
 </div>
 
+<!-- AI-аналітика (показується замість стрічки після натискання «🧠 Аналітика») -->
+<div id="analytics-result" class="analytics-result" style="display:none">
+  <div class="analytics-head">
+    <div class="analytics-title">🧠 AI-аналітика — <span id="analytics-q"></span></div>
+    <button type="button" class="analytics-close" onclick="closeAnalytics()"
+            title="Закрити і повернути стрічку постів">✕</button>
+  </div>
+  <div id="analytics-meta" class="analytics-meta"></div>
+  <div id="analytics-body" class="analytics-body"></div>
+</div>
+
 <!-- Main -->
-<div class="main-grid">
+<div class="main-grid" id="main-grid">
 
   <!-- Feed -->
   <div>
@@ -676,7 +741,7 @@ function toggleCustomDates() {
   block.classList.toggle('show');
 }
 
-let _currentPeriod = 'day';
+let _currentPeriod = {{ words_period|tojson }};
 const _TOPIC_CATS = ['per','loc','org','term'];
 const _CHANNEL_LIST = {{ channel_list | tojson }};
 
@@ -777,8 +842,9 @@ function confirmStopWord(yes) {
   }).then(() => loadTopWords(_currentPeriod));
 }
 
+// Старт: підвантажити топ-слова (якщо server-render віддав порожньо — загорнеться у retry-loop)
 document.addEventListener('DOMContentLoaded', () => {
-  document.querySelector('.period-tab[data-period="day"]').classList.add('active');
+  loadTopWords(_currentPeriod);
 });
 
 // ── Динаміка згадок (Chart.js) ───────────────────────────────────────────────
@@ -804,6 +870,14 @@ function fmtBig(n) {                            // 12345 → '12.3k', 1234567 �
   if (n < 1000) return String(n);
   if (n < 1_000_000) return (n/1000).toFixed(n < 10000 ? 1 : 0) + 'k';
   return (n/1_000_000).toFixed(n < 10_000_000 ? 1 : 0) + 'M';
+}
+
+function fmtBigUA(n) {                          // 20500000 → '20.5 млн', 12300 → '12.3 тис.'
+  if (n == null || !n) return '0';
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return (n/1000).toFixed(n < 10000 ? 1 : 0) + ' тис.';
+  if (n < 1_000_000_000) return (n/1_000_000).toFixed(n < 10_000_000 ? 1 : 0) + ' млн';
+  return (n/1_000_000_000).toFixed(n < 10_000_000_000 ? 1 : 0) + ' млрд';
 }
 
 let _reachPollTimer = null;
@@ -853,6 +927,12 @@ function applyReachData(reachData, days) {
   // Підпис «Згадки» для першого датасету
   if (timelineChart.data.datasets[0] && !timelineChart.data.datasets[0].label) {
     timelineChart.data.datasets[0].label = 'Згадки';
+  }
+  // Сумарне охоплення поряд з заголовком
+  const totalViews = values.reduce((s, v) => s + (v || 0), 0);
+  const totalEl = document.getElementById('timeline-reach-total');
+  if (totalEl) {
+    totalEl.textContent = totalViews ? `Σ охоплення: ${fmtBigUA(totalViews)} переглядів` : '';
   }
   timelineChart.update();
 }
@@ -916,13 +996,8 @@ async function loadReach(days) {
     }
     if (st.state === 'done') {
       applyReachData(st.data, days);
-      const n = st.posts_total || 0;
-      if (st.sampled) {
-        const k = st.posts_sampled || 0;
-        setReachStatus(`Охоплення (≈ за вибіркою ${k} з ${n} постів)`, 'done');
-      } else {
-        setReachStatus(`Охоплення зібрано (постів: ${n})`, 'done');
-      }
+      const totalViews = (st.data || []).reduce((sum, d) => sum + (d.views || 0), 0);
+      setReachStatus(`Охоплення зібрано та становить ${fmtBigUA(totalViews)} переглядів`, 'done');
       return;
     }
     if (st.state === 'error') {
@@ -938,11 +1013,62 @@ async function loadReach(days) {
   _reachPollTimer = setTimeout(poll, 1500);
 }
 
+// Підписи значень безпосередньо на графіку.
+// • Згадки (перший dataset, count) — над точкою.
+// • Охоплення (dataset з _kind='reach', views) — під точкою, у форматі fmtBigUA.
+// Малюємо локальні максимуми + крайні точки завжди, інші ненульові — якщо вистачає місця.
+const pointValueLabelsPlugin = {
+  id: 'pointValueLabels',
+  afterDatasetsDraw(chart) {
+    const {ctx} = chart;
+    const datasets = chart.data.datasets || [];
+    ctx.save();
+    ctx.font = '600 10px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+
+    datasets.forEach((ds, dsIdx) => {
+      if (!ds || !ds.data || !ds.data.length) return;
+      const meta = chart.getDatasetMeta(dsIdx);
+      if (!meta || !meta.data) return;
+      const data = ds.data;
+      const last = data.length - 1;
+      const isReach = ds._kind === 'reach';
+      const isPeak = (i) => {
+        const v = data[i];
+        if (!v) return false;
+        const l = i > 0 ? data[i-1] : -Infinity;
+        const r = i < last ? data[i+1] : -Infinity;
+        return v >= l && v >= r;
+      };
+      const fmt = isReach ? fmtBigUA : (v) => String(v);
+      ctx.fillStyle = isReach ? '#90e0ef' : '#c4bfff';
+      ctx.textBaseline = isReach ? 'top' : 'bottom';
+      const minStep = isReach ? 38 : 28;
+      let lastDrawX = -Infinity;
+      for (let i = 0; i < data.length; i++) {
+        const v = data[i];
+        if (!v) continue;
+        const point = meta.data[i];
+        if (!point) continue;
+        const force = (i === 0) || (i === last) || isPeak(i);
+        if (!force && point.x - lastDrawX < minStep) continue;
+        const yOffset = isReach ? 6 : -6;
+        ctx.fillText(fmt(v), point.x, point.y + yOffset);
+        lastDrawX = point.x;
+      }
+    });
+    ctx.restore();
+  }
+};
+
 async function loadTimeline(days) {
   if (typeof Chart === 'undefined') return;     // CDN ще не завантажений
   const card = document.getElementById('timeline-card');
   if (!card) return;
   _reachCurrentDays = days;
+  // Скидаємо попередню Σ охоплення при зміні діапазону днів
+  const totalEl = document.getElementById('timeline-reach-total');
+  if (totalEl) totalEl.textContent = '';
   const q       = card.dataset.q || '';
   const channel = card.dataset.channel || '';
   const params  = new URLSearchParams({ q, channel, days: String(days) });
@@ -954,6 +1080,7 @@ async function loadTimeline(days) {
   if (timelineChart) timelineChart.destroy();
   timelineChart = new Chart(document.getElementById('timeline-chart'), {
     type: 'line',
+    plugins: [pointValueLabelsPlugin],
     data: {
       labels,
       datasets: [{
@@ -1022,10 +1149,12 @@ async function loadTimeline(days) {
 }
 
 // ── Завантаження xlsx: візуальний фідбек і захист від подвійного кліку ──────
+// Експорт використовує query-параметри поточної сторінки (а не серіалізацію форми),
+// щоб гарантовано завантажити саме ту вибірку, яку бачить користувач. Інакше
+// hidden `period=custom` всередині custom-dates перебивав активний preset.
 document.addEventListener('DOMContentLoaded', () => {
-  const dlBtn = document.querySelector('button[formaction="/api/export-xlsx"]');
-  const form  = document.getElementById('search-form');
-  if (!dlBtn || !form) return;
+  const dlBtn = document.getElementById('export-xlsx-btn');
+  if (!dlBtn) return;
   const originalText = dlBtn.textContent;
   let inFlight = false;
 
@@ -1036,17 +1165,14 @@ document.addEventListener('DOMContentLoaded', () => {
     dlBtn.style.opacity = '';
   }
 
-  form.addEventListener('submit', (e) => {
-    if (e.submitter !== dlBtn) return;
-    if (inFlight) { e.preventDefault(); return; }
+  dlBtn.addEventListener('click', () => {
+    if (inFlight) return;
     inFlight = true;
-    // disabled треба ставити після того як форма подалась, бо disabled-кнопку
-    // браузер ігнорує як submitter і formaction не спрацює
-    setTimeout(() => {
-      dlBtn.disabled = true;
-      dlBtn.style.opacity = '0.6';
-      dlBtn.textContent = '⏳ Збирається... (може зайняти кілька хвилин)';
-    }, 30);
+    dlBtn.dataset.startedAt = String(performance.now());
+    dlBtn.disabled = true;
+    dlBtn.style.opacity = '0.6';
+    dlBtn.textContent = '⏳ Збирається... (може зайняти кілька хвилин)';
+    window.location.href = '/api/export-xlsx' + window.location.search;
   });
 
   // Коли користувач повертається на вкладку (після save dialog) — повертаємо кнопку
@@ -1054,9 +1180,96 @@ document.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('pageshow', () => { if (inFlight) reset(); });
   // Гарантований fallback через 15 хв
   setInterval(() => {
-    if (inFlight && performance.now() - (dlBtn.dataset.startedAt || 0) > 900000) reset();
+    if (inFlight && performance.now() - Number(dlBtn.dataset.startedAt || 0) > 900000) reset();
   }, 30000);
 });
+
+// ── AI-аналітика: запит до /api/analytics + рендер замість стрічки постів ────
+document.addEventListener('DOMContentLoaded', () => {
+  const btn = document.getElementById('analytics-btn');
+  if (!btn || btn.disabled) return;
+  btn.addEventListener('click', startAnalytics);
+});
+
+const ANALYTICS_ERR = {
+  q_required:         'Спочатку введіть ключове слово в полі пошуку.',
+  period_not_allowed: 'AI-аналітика доступна лише для періодів «Доба» або «Тиждень».',
+  no_posts:           'За цим запитом немає постів у вибраному періоді.',
+  empty_texts:        'Знайдені пости порожні — нічого аналізувати.',
+  key_missing:        'На сервері немає файлу /root/.anthropic_key — налаштуйте API-ключ Claude.',
+  key_empty:          'Файл /root/.anthropic_key порожній.',
+  sdk_missing:        'На сервері не встановлено пакет anthropic — потрібен pip install anthropic.',
+};
+
+async function startAnalytics() {
+  const btn = document.getElementById('analytics-btn');
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ Аналізую...';
+
+  // Параметри беремо з поточного URL — рівно ті ж фільтри, що й на сторінці
+  const u = new URL(window.location.href);
+  const params = {
+    q:         u.searchParams.get('q') || '',
+    channel:   u.searchParams.get('channel') || '',
+    period:    u.searchParams.get('period') || '24h',
+    from_date: u.searchParams.get('from_date') || '',
+    to_date:   u.searchParams.get('to_date') || '',
+  };
+
+  try {
+    const r = await fetch('/api/analytics', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(params),
+    });
+    if (r.status === 429) {
+      alert('Зайнято — інша AI-аналітика виконується. Спробуйте за 5 секунд.');
+      return;
+    }
+    const j = await r.json();
+    if (j.error) { alert(ANALYTICS_ERR[j.error] || ('Помилка: ' + j.error)); return; }
+    if (j.state === 'done') return renderAnalytics(j.data, params.q);
+
+    while (true) {
+      await new Promise(res => setTimeout(res, 2500));
+      const s = await fetch('/api/analytics/' + j.task_id).then(x => x.json());
+      if (s.state === 'done')  return renderAnalytics(s.data, params.q);
+      if (s.state === 'error') {
+        alert(ANALYTICS_ERR[s.error] || ('Помилка: ' + s.error));
+        return;
+      }
+    }
+  } catch (e) {
+    alert('Мережева помилка: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
+function renderAnalytics(data, q) {
+  document.getElementById('analytics-q').textContent = `«${q}»`;
+  const used = data.posts_used, total = data.posts_total;
+  let meta = `Проаналізовано ${used}`;
+  if (used < total) meta += ` з ${total} (обрізано через ліміт контексту)`;
+  else              meta += ` постів`;
+  meta += ` · модель ${data.model}`;
+  if (data.elapsed_sec) meta += ` · ${data.elapsed_sec}с`;
+  document.getElementById('analytics-meta').textContent = meta;
+  document.getElementById('analytics-body').innerHTML = data.html;
+  document.getElementById('analytics-result').style.display = 'block';
+  // Згідно ТЗ — стрічка постів ховається на час перегляду аналітики
+  const grid = document.getElementById('main-grid');
+  if (grid) grid.style.display = 'none';
+  document.getElementById('analytics-result').scrollIntoView({behavior: 'smooth', block: 'start'});
+}
+
+function closeAnalytics() {
+  document.getElementById('analytics-result').style.display = 'none';
+  const grid = document.getElementById('main-grid');
+  if (grid) grid.style.display = '';
+}
 
 document.addEventListener('DOMContentLoaded', () => {
   const tabs = document.querySelectorAll('.timeline-tab');
@@ -1192,7 +1405,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 })();
 
-// ── PDF звіт (html2canvas → jsPDF, multi-page) ──────────────────────────────
+// ── PDF звіт (html2canvas → jsPDF, одна сторінка з заголовком) ──────────────
 async function generatePDF(btn) {
   if (!window.html2canvas || !window.jspdf) {
     alert('Бібліотеки PDF ще завантажуються — спробуй за мить.');
@@ -1205,6 +1418,31 @@ async function generatePDF(btn) {
   btn.disabled = true;
   btn.textContent = '⏳ Готую…';
 
+  // Витягуємо параметри з URL для заголовку
+  const u = new URL(window.location.href);
+  const q = u.searchParams.get('q') || '';
+  const periodLabel = {{ period_label|tojson }};
+  const periodDates = {{ period_dates|tojson }};
+
+  // Тимчасовий заголовок — вставляємо першим дочірнім у report-root
+  const header = document.createElement('div');
+  header.id = 'pdf-report-header';
+  header.style.cssText =
+    'background:#080b14;color:#e2e8f0;padding:1.5rem 2rem 1rem;margin-bottom:1rem;' +
+    'border-bottom:2px solid rgba(108,99,255,0.4);text-align:center;' +
+    'font-family:system-ui,sans-serif;';
+  const subParts = [];
+  if (q) subParts.push(`по ключовому слову «${q}»`);
+  if (periodLabel) subParts.push(periodLabel + (periodDates ? ` (${periodDates})` : ''));
+  header.innerHTML =
+    '<div style="font-size:1.3rem;font-weight:800;color:#c4bfff;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:.4rem;">' +
+      'МОНІТОРИНГ МЕДІА-ПРОСТОРУ МЕСЕНДЖЕРА «MAX»' +
+    '</div>' +
+    '<div style="font-size:1rem;font-weight:600;color:#e2e8f0;">' +
+      'Звіт ' + (subParts.length ? subParts.join(' · ') : '— загальний') +
+    '</div>';
+  root.insertBefore(header, root.firstChild);
+
   try {
     const canvas = await html2canvas(root, {
       scale: 2,
@@ -1214,7 +1452,8 @@ async function generatePDF(btn) {
       windowWidth: root.scrollWidth,
       ignoreElements: (el) => {
         if (!el.classList) return false;
-        return el.classList.contains('search-wrap')
+        return el.classList.contains('stat-grid')          // 4 картки зверху (Всього постів / Каналів / За годину / За 24 год)
+            || el.classList.contains('search-wrap')
             || el.classList.contains('channel-ac-list')
             || el.classList.contains('stop-btn')
             || el.classList.contains('stop-modal-overlay');
@@ -1226,18 +1465,24 @@ async function generatePDF(btn) {
     const pdf = new jsPDF({ orientation: 'p', unit: 'mm', format: 'a4' });
     const pageW = pdf.internal.pageSize.getWidth();
     const pageH = pdf.internal.pageSize.getHeight();
-    const imgH = canvas.height * pageW / canvas.width;
+    const margin = 5;
+    const availW = pageW - margin * 2;
+    const availH = pageH - margin * 2;
 
-    let heightLeft = imgH;
-    let position = 0;
-    pdf.addImage(imgData, 'JPEG', 0, position, pageW, imgH);
-    heightLeft -= pageH;
-    while (heightLeft > 0) {
-      position = heightLeft - imgH;       // негативний зсув — "розрізаємо" одну довгу картинку на сторінки
-      pdf.addPage();
-      pdf.addImage(imgData, 'JPEG', 0, position, pageW, imgH);
-      heightLeft -= pageH;
+    // Вписуємо все на одну сторінку: масштабуємо за тим виміром, що "вужчий"
+    const imgRatio = canvas.width / canvas.height;
+    const pageRatio = availW / availH;
+    let drawW, drawH;
+    if (imgRatio > pageRatio) {
+      drawW = availW;
+      drawH = availW / imgRatio;
+    } else {
+      drawH = availH;
+      drawW = availH * imgRatio;
     }
+    const offsetX = (pageW - drawW) / 2;
+    const offsetY = margin;
+    pdf.addImage(imgData, 'JPEG', offsetX, offsetY, drawW, drawH);
 
     const d = new Date();
     const pad = n => String(n).padStart(2,'0');
@@ -1247,6 +1492,9 @@ async function generatePDF(btn) {
     console.error('[report] failed:', err);
     alert('Не вдалось сформувати звіт: ' + (err && err.message || err));
   } finally {
+    // Прибираємо тимчасовий заголовок — у будь-якому разі
+    const h = document.getElementById('pdf-report-header');
+    if (h) h.remove();
     btn.disabled = false;
     btn.textContent = origText;
   }
@@ -1355,6 +1603,26 @@ PERIOD_LABELS = {
 }
 DEFAULT_PERIOD = "24h"
 _DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+
+def _format_period_dates(period: str, since_ts: str | None, until_ts: str | None) -> str:
+    """Повертає рядок з датами діапазону для UI: 'DD.MM.YYYY — DD.MM.YYYY'.
+    Для period='all' повертає порожній рядок."""
+    if period == "all":
+        return ""
+    def _fmt(ts: str) -> str:
+        try:
+            return datetime.strptime(ts[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
+        except ValueError:
+            return ts[:10]
+    now_str = datetime.now().strftime("%d.%m.%Y")
+    if since_ts and until_ts:
+        return f"{_fmt(since_ts)} — {_fmt(until_ts)}"
+    if since_ts:
+        return f"{_fmt(since_ts)} — {now_str}"
+    if until_ts:
+        return f"… — {_fmt(until_ts)}"
+    return ""
 
 
 def parse_time_filter(period: str, from_date: str, to_date: str) -> tuple[str | None, str | None, str]:
@@ -1518,6 +1786,45 @@ def get_top_channels(db, q: str, since_ts: str | None, until_ts: str | None,
     with _top_channels_lock:
         _top_channels_cache[key] = (time.time(), rows)
     return rows
+
+
+def get_top_channels_total(db, q: str, since_ts: str | None, until_ts: str | None,
+                           mode: str = "all") -> int:
+    """Загальна кількість унікальних каналів у вибірці (не обмежена LIMIT 20)."""
+    alert_aliases = _load_alert_channels() if mode != "all" else set()
+    if mode == "alert" and not alert_aliases:
+        return 0
+
+    if q:
+        tc_from = ("FROM messages JOIN messages_fts ON messages.id = messages_fts.rowid "
+                   "WHERE messages_fts MATCH ?")
+        params: list = [build_fts_query(q)]
+        if since_ts:
+            tc_from += " AND messages.saved_at >= ?"; params.append(since_ts)
+        if until_ts:
+            tc_from += " AND messages.saved_at <= ?"; params.append(until_ts)
+        link_col = "messages.channel_link"
+        title_col = "messages.channel_title"
+        has_where = True
+    else:
+        tc_from = "FROM messages"
+        params = []
+        link_col = "channel_link"
+        title_col = "channel_title"
+        has_where = False
+
+    if mode in ("main", "alert") and alert_aliases:
+        alert_links = [f"https://max.ru/{a}".lower() for a in alert_aliases]
+        ph = ",".join("?" * len(alert_links))
+        op = "NOT IN" if mode == "main" else "IN"
+        glue = "AND" if has_where else "WHERE"
+        tc_from += f" {glue} lower({link_col}) {op} ({ph})"
+        params.extend(alert_links)
+
+    try:
+        return db.execute(f"SELECT COUNT(DISTINCT {title_col}) {tc_from}", params).fetchone()[0] or 0
+    except sqlite3.OperationalError:
+        return 0
 
 def get_stats(db) -> dict:
     global _stats_cache
@@ -1689,6 +1996,183 @@ def _run_reach_task(task_id: str, q: str, channel: str, days: int):
         task.update(state="error", error=f"exception: {e}", ts_done=time.time())
     finally:
         _reach_running["busy"] = False
+
+
+# ── AI-аналітика через Claude API ─────────────────────────────────────────────
+# Promt з summary.txt + усі пости за поточним фільтром (q + period). Виклик
+# повільний (15-30с на Opus), тому async-task pattern як у reach. Глобальний
+# семафор: один Claude-запит одночасно.
+
+_analytics_cache:   dict[tuple, tuple[float, dict]] = {}
+_analytics_tasks:   dict[str, dict] = {}
+_analytics_lock     = threading.Lock()
+_analytics_running: dict[str, bool] = {"busy": False}
+
+
+def _analytics_gc():
+    now = time.time()
+    with _analytics_lock:
+        stale = [tid for tid, t in _analytics_tasks.items()
+                 if now - t.get("ts_done", t["ts_started"]) > ANALYTICS_TASK_TTL]
+        for tid in stale:
+            _analytics_tasks.pop(tid, None)
+
+
+def _load_anthropic_client() -> tuple[object | None, str | None]:
+    """Lazy import + ключ з файлу. Якщо є .anthropic_gateway — використовує
+    base_url проксі (для обходу гео-блоку). Повертає (client, error_code)."""
+    if not ANTHROPIC_KEY_FILE.exists():
+        return None, "key_missing"
+    key = ANTHROPIC_KEY_FILE.read_text(encoding="utf-8").strip()
+    if not key:
+        return None, "key_empty"
+    try:
+        from anthropic import Anthropic
+    except ImportError:
+        return None, "sdk_missing"
+    kwargs: dict = {"api_key": key}
+    if ANTHROPIC_GATEWAY_FILE.exists():
+        gw = ANTHROPIC_GATEWAY_FILE.read_text(encoding="utf-8").strip()
+        if gw:
+            kwargs["base_url"] = gw
+            if ANTHROPIC_GATEWAY_TOKEN_FILE.exists():
+                tok = ANTHROPIC_GATEWAY_TOKEN_FILE.read_text(encoding="utf-8").strip()
+                if tok:
+                    kwargs["default_headers"] = {"cf-aig-authorization": f"Bearer {tok}"}
+    return Anthropic(**kwargs), None
+
+
+def _build_analytics_input(rows: list[sqlite3.Row]) -> tuple[str, int]:
+    """Серіалізує пости у блок тексту для Claude. Дуже довгі обрізає, зупиняється
+    при досягненні ANALYTICS_MAX_INPUT_CHARS. Повертає (text, used_count)."""
+    parts: list[str] = []
+    used = 0
+    total_chars = 0
+    for r in rows:
+        text = (r["text"] or "").strip()
+        if not text:
+            continue
+        if len(text) > ANALYTICS_POST_TRIM_CHARS:
+            text = text[:ANALYTICS_POST_TRIM_CHARS] + "…"
+        block = f"[{r['msg_time']}] {r['channel_title']}\n{text}\n---\n"
+        if total_chars + len(block) > ANALYTICS_MAX_INPUT_CHARS:
+            break
+        parts.append(block)
+        total_chars += len(block)
+        used += 1
+    return "".join(parts), used
+
+
+def _md_to_html(md: str) -> str:
+    """Мінімальний md→html для відповіді Claude (## заголовки, **bold**,
+    нумеровані списки, абзаци). HTML-escape всього іншого. Без зовнішніх залежностей."""
+    from html import escape
+    out: list[str] = []
+    para: list[str] = []
+
+    def flush():
+        if para:
+            txt = " ".join(para)
+            txt = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", txt)
+            out.append(f"<p>{txt}</p>")
+            para.clear()
+
+    for raw in md.splitlines():
+        line = escape(raw.rstrip())
+        if not line.strip():
+            flush()
+            continue
+        if line.startswith("## "):
+            flush()
+            out.append(f"<h3>{line[3:]}</h3>")
+        elif re.match(r"^\d+\.\s", line):
+            flush()
+            line_html = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", line)
+            out.append(f'<div class="ai-list-item">{line_html}</div>')
+        else:
+            para.append(line)
+    flush()
+    return "\n".join(out)
+
+
+def _run_analytics_task(task_id: str, q: str, channel: str,
+                        since_ts: str | None, until_ts: str | None):
+    task = _analytics_tasks[task_id]
+    try:
+        db = get_db()
+        try:
+            rows = _query_export_rows(db, q, channel, since_ts, until_ts, sort="new")
+        finally:
+            db.close()
+
+        if not rows:
+            task.update(state="error", error="no_posts", ts_done=time.time())
+            return
+
+        posts_total = len(rows)
+        posts_text, posts_used = _build_analytics_input(rows)
+        if posts_used == 0:
+            task.update(state="error", error="empty_texts", ts_done=time.time())
+            return
+
+        try:
+            system_prompt = SUMMARY_PROMPT_FILE.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            task.update(state="error", error=f"prompt_read: {e}", ts_done=time.time())
+            return
+
+        client, err = _load_anthropic_client()
+        if err:
+            task.update(state="error", error=err, ts_done=time.time())
+            return
+
+        period_descr = ""
+        if since_ts and until_ts:
+            period_descr = f"з {since_ts} по {until_ts}"
+        elif since_ts:
+            period_descr = f"з {since_ts} по теперішній час"
+        else:
+            period_descr = "за весь час"
+
+        user_msg = (
+            f"Ключове слово пошуку: «{q}»\n"
+            f"Канал: {channel or '(усі канали)'}\n"
+            f"Період: {period_descr}\n"
+            f"Постів у вибірці: {posts_used} з {posts_total}\n\n"
+            f"=== ПОСТИ ===\n{posts_text}"
+        )
+
+        task["state"] = "running"
+        print(f"[analytics] start: q={q!r} channel={channel!r} posts={posts_used}/{posts_total} chars={len(posts_text)}",
+              flush=True)
+        t0 = time.time()
+        resp = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=2_500,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        elapsed = time.time() - t0
+        answer = resp.content[0].text
+        print(f"[analytics] done in {elapsed:.1f}s, answer={len(answer)} chars", flush=True)
+
+        result = {
+            "markdown": answer,
+            "html": _md_to_html(answer),
+            "posts_total": posts_total,
+            "posts_used": posts_used,
+            "model": ANTHROPIC_MODEL,
+            "elapsed_sec": round(elapsed, 1),
+        }
+        task.update(state="done", data=result, ts_done=time.time())
+        cache_key = (q, channel, since_ts or "", until_ts or "")
+        with _analytics_lock:
+            _analytics_cache[cache_key] = (time.time(), result)
+    except Exception as e:
+        print(f"[analytics] error: {e}", flush=True)
+        task.update(state="error", error=f"exception: {e}", ts_done=time.time())
+    finally:
+        _analytics_running["busy"] = False
 
 
 _ALLOWED_TIMELINE_DAYS = (7, 30, 90)
@@ -2078,6 +2562,68 @@ def api_timeline_reach_status(task_id: str):
     return jsonify(out)
 
 
+_ANALYTICS_ALLOWED_PERIODS = ("24h", "7d")
+
+
+@app.route("/api/analytics", methods=["POST"])
+def api_analytics_start():
+    data = request.json or {}
+    q       = (data.get("q") or "").strip()
+    if not q:
+        return jsonify({"error": "q_required"}), 400
+    channel = (data.get("channel") or "").strip()
+    period_in = (data.get("period") or DEFAULT_PERIOD).strip()
+    if period_in not in _ANALYTICS_ALLOWED_PERIODS:
+        return jsonify({"error": "period_not_allowed"}), 400
+    from_date = (data.get("from_date") or "").strip()
+    to_date   = (data.get("to_date") or "").strip()
+    since_ts, until_ts, _ = parse_time_filter(period_in, from_date, to_date)
+
+    cache_key = (q, channel, since_ts or "", until_ts or "")
+    with _analytics_lock:
+        cached = _analytics_cache.get(cache_key)
+        if cached and time.time() - cached[0] < ANALYTICS_CACHE_TTL:
+            return jsonify({
+                "task_id": "cached", "state": "done",
+                "data": cached[1], "cached": True,
+            })
+
+    _analytics_gc()
+
+    with _analytics_lock:
+        if _analytics_running["busy"]:
+            return jsonify({"error": "busy", "retry_after": 5}), 429
+        _analytics_running["busy"] = True
+        task_id = uuid.uuid4().hex[:12]
+        _analytics_tasks[task_id] = {
+            "state": "pending",
+            "ts_started": time.time(),
+            "params": {"q": q, "channel": channel,
+                       "since_ts": since_ts, "until_ts": until_ts},
+        }
+
+    threading.Thread(
+        target=_run_analytics_task,
+        args=(task_id, q, channel, since_ts, until_ts), daemon=True
+    ).start()
+
+    return jsonify({"task_id": task_id, "state": "pending"})
+
+
+@app.route("/api/analytics/<task_id>")
+def api_analytics_status(task_id: str):
+    with _analytics_lock:
+        task = _analytics_tasks.get(task_id)
+    if not task:
+        return jsonify({"error": "unknown_task"}), 404
+    out = {"state": task["state"]}
+    if task["state"] == "done":
+        out["data"] = task["data"]
+    elif task["state"] == "error":
+        out["error"] = task.get("error", "unknown")
+    return jsonify(out)
+
+
 @app.route("/api/top-words")
 def api_top_words():
     period = request.args.get("period", "day")
@@ -2252,9 +2798,6 @@ def index():
     q            = request.args.get("q", "").strip()
     channel      = request.args.get("channel", "").strip()
     page         = max(1, int(request.args.get("page", 1)))
-    words_period = request.args.get("wp", "day")
-    if words_period not in ("day", "week", "month"):
-        words_period = "day"
 
     period_in = request.args.get("period", DEFAULT_PERIOD).strip()
     if period_in not in ("1h","24h","7d","30d","all","custom"):
@@ -2262,6 +2805,13 @@ def index():
     from_date = request.args.get("from_date", "").strip()
     to_date   = request.args.get("to_date", "").strip()
     since_ts, until_ts, period = parse_time_filter(period_in, from_date, to_date)
+
+    # Період для топ-слів синхронізується з основним фільтром пошуку
+    _PERIOD_TO_WORDS = {"1h": "day", "24h": "day", "7d": "week",
+                        "30d": "month", "all": "month", "custom": "month"}
+    words_period = _PERIOD_TO_WORDS.get(period, "day")
+    _WORDS_PERIOD_LABELS = {"day": "за 24 години", "week": "за 7 днів", "month": "за 30 днів"}
+    words_period_label = _WORDS_PERIOD_LABELS.get(words_period, "")
 
     sort = request.args.get("sort", "new")
     if sort not in ("new", "old"):
@@ -2341,10 +2891,14 @@ def index():
     # (основний потік + alert-канали з channels/alert_channels.txt). TTL 60с.
     if q:
         top_channels = get_top_channels(db, q, since_ts, until_ts, mode="all")
+        top_channels_total = get_top_channels_total(db, q, since_ts, until_ts, mode="all")
         top_channels_alert = None
+        top_channels_alert_total = 0
     else:
         top_channels = get_top_channels(db, q, since_ts, until_ts, mode="main")
+        top_channels_total = get_top_channels_total(db, q, since_ts, until_ts, mode="main")
         top_channels_alert = get_top_channels(db, q, since_ts, until_ts, mode="alert")
+        top_channels_alert_total = get_top_channels_total(db, q, since_ts, until_ts, mode="alert")
 
     # Топ слів (з урахуванням обраного каналу)
     top_words = get_top_words(db, words_period, channel)
@@ -2365,17 +2919,22 @@ def index():
     highlight_days = {"24h": 1, "7d": 7, "30d": 30}.get(period, 0)
     sparkline_svg = render_sparkline_svg(timeline, highlight_days=highlight_days)
     period_label = PERIOD_LABELS.get(period, "")
+    period_dates = _format_period_dates(period, since_ts, until_ts)
 
     return render_template_string(TEMPLATE,
         stats=stats, posts=posts,
         q=q, channel=channel, page=page,
         total_count=total_count, total_pages=total_pages,
         channel_list=channel_list, top_channels=top_channels,
+        top_channels_total=top_channels_total,
         top_channels_alert=top_channels_alert,
+        top_channels_alert_total=top_channels_alert_total,
         top_words=top_words, words_period=words_period,
         nlp_ready=nlp_mod.nlp_available(),
         period=period, from_date=from_date, to_date=to_date, sort=sort,
-        period_label=period_label, sparkline_svg=sparkline_svg,
+        period_label=period_label, period_dates=period_dates,
+        words_period_label=words_period_label,
+        sparkline_svg=sparkline_svg,
         now=now_ts,
     )
 

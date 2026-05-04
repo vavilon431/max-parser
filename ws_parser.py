@@ -17,12 +17,14 @@ from datetime import datetime
 
 import websockets
 
+from ws_common import (
+    WS_URL, WS_HEADERS, get_device_id, get_login_token,
+    handshake_payload, make_msg,
+)
+
 # ── Конфіг ────────────────────────────────────────────────────────────────────
 
-WS_URL            = "wss://ws-api.oneme.ru/websocket"
 RESOLVED_FILE     = Path(__file__).parent / "channels" / "resolved.json"
-LOGIN_TOKEN_FILE  = Path(__file__).parent / ".login_token"
-DEVICE_ID_FILE    = Path(__file__).parent / ".device_id"
 DB_FILE           = Path(__file__).parent / "matches.db"
 
 CHANNELS_PER_WORKER  = 500   # каналів на одне WS з'єднання
@@ -38,20 +40,6 @@ def ts():
 def now_iso():
     """Повний timestamp для збереження в БД (YYYY-MM-DD HH:MM:SS)."""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-def get_device_id() -> str:
-    if DEVICE_ID_FILE.exists():
-        return DEVICE_ID_FILE.read_text().strip()
-    device_id = f"web_{int(time.time())}"
-    DEVICE_ID_FILE.write_text(device_id)
-    return device_id
-
-def get_login_token() -> str:
-    if LOGIN_TOKEN_FILE.exists():
-        return LOGIN_TOKEN_FILE.read_text().strip()
-    print("ПОМИЛКА: файл .login_token не знайдено.")
-    print(f"Створи: echo 'ТВІЙ_ТОКЕН' > {LOGIN_TOKEN_FILE}")
-    sys.exit(1)
 
 def load_resolved() -> dict[str, dict]:
     if not RESOLVED_FILE.exists():
@@ -180,22 +168,10 @@ class WSClient:
             print(f"[{ts()}][W{self.worker_id}] _recv_loop exception: {e}", flush=True)
 
     async def connect(self) -> bool:
-        headers = {
-            "Origin": "https://web.max.ru",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-        }
-        self._ws = await websockets.connect(WS_URL, additional_headers=headers, ping_interval=30)
+        self._ws = await websockets.connect(WS_URL, additional_headers=WS_HEADERS, ping_interval=30)
         self._recv_task = asyncio.create_task(self._recv_loop())
 
-        hs = await self._send_recv(6, {
-            "deviceId": self.device_id,
-            "userAgent": {
-                "deviceType": "WEB", "locale": "ru", "deviceLocale": "ru",
-                "osVersion": "Windows 10", "deviceName": "Chrome",
-                "headerUserAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-                "appVersion": "1.0.0", "screen": "1920x1080", "timezone": "Europe/Moscow",
-            },
-        })
+        hs = await self._send_recv(6, handshake_payload(self.device_id))
         if not hs or hs.get("cmd") == 3:
             return False
 
@@ -212,10 +188,7 @@ class WSClient:
         s = self._ns()
         fut = asyncio.get_running_loop().create_future()
         self._pending[s] = fut
-        await self._ws.send(json.dumps(
-            {"ver": 11, "cmd": 0, "seq": s, "opcode": opcode, "payload": payload},
-            ensure_ascii=False
-        ))
+        await self._ws.send(make_msg(s, opcode, payload))
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
@@ -298,10 +271,8 @@ async def worker(worker_id: int, token: str, device_id: str,
 
             log(f"Підписуємось на {len(chat_ids)} каналів...")
             for chat_id in chat_ids:
-                await client._ws.send(json.dumps(
-                    {"ver": 11, "cmd": 0, "seq": client._ns(), "opcode": 75,
-                     "payload": {"chatId": chat_id, "subscribe": True}},
-                    ensure_ascii=False
+                await client._ws.send(make_msg(
+                    client._ns(), 75, {"chatId": chat_id, "subscribe": True}
                 ))
                 await asyncio.sleep(0.03)
 

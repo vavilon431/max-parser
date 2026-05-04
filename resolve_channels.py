@@ -7,19 +7,20 @@ MAX — резолвінг каналів: aliases → chatIds.
 import asyncio
 import json
 import time
-import sys
 from pathlib import Path
 from datetime import datetime
 
 import websockets
 
-LOGIN_TOKEN_FILE = Path(__file__).parent / ".login_token"
-DEVICE_ID_FILE   = Path(__file__).parent / ".device_id"
+from ws_common import (
+    WS_URL, WS_HEADERS, get_device_id, get_login_token,
+    handshake_payload, make_msg,
+)
+
 CHANNELS_FILE    = Path(__file__).parent / "channels" / "channels.txt"
 RESOLVED_FILE    = Path(__file__).parent / "channels" / "resolved.json"
 FAILED_FILE      = Path(__file__).parent / "channels" / "failed.txt"
 
-WS_URL           = "wss://ws-api.oneme.ru/websocket"
 BATCH_SIZE       = 15    # паралельних op=89 за раз
 BATCH_DELAY      = 0.3   # секунд між батчами
 SAVE_EVERY       = 100   # зберігати проміжний результат кожні N каналів
@@ -27,19 +28,6 @@ SAVE_EVERY       = 100   # зберігати проміжний результ�
 
 def ts():
     return datetime.now().strftime("%H:%M:%S")
-
-def get_device_id() -> str:
-    if DEVICE_ID_FILE.exists():
-        return DEVICE_ID_FILE.read_text().strip()
-    device_id = f"web_{int(time.time())}"
-    DEVICE_ID_FILE.write_text(device_id)
-    return device_id
-
-def get_login_token() -> str:
-    if LOGIN_TOKEN_FILE.exists():
-        return LOGIN_TOKEN_FILE.read_text().strip()
-    print("ПОМИЛКА: файл .login_token не знайдено.")
-    sys.exit(1)
 
 def load_aliases() -> list[str]:
     aliases = []
@@ -62,23 +50,11 @@ class Resolver:
         return self._seq
 
     async def connect(self) -> bool:
-        headers = {
-            "Origin": "https://web.max.ru",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-        }
-        self._ws = await websockets.connect(WS_URL, additional_headers=headers, ping_interval=30)
+        self._ws = await websockets.connect(WS_URL, additional_headers=WS_HEADERS, ping_interval=30)
 
         # Handshake
         s = self._ns()
-        await self._ws.send(json.dumps({"ver": 11, "cmd": 0, "seq": s, "opcode": 6, "payload": {
-            "deviceId": self.device_id,
-            "userAgent": {
-                "deviceType": "WEB", "locale": "ru", "deviceLocale": "ru",
-                "osVersion": "Windows 10", "deviceName": "Chrome",
-                "headerUserAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-                "appVersion": "1.0.0", "screen": "1920x1080", "timezone": "Europe/Moscow",
-            },
-        }}, ensure_ascii=False))
+        await self._ws.send(make_msg(s, 6, handshake_payload(self.device_id)))
         hs = await self._recv_seq(s, timeout=8)
         if not hs or hs.get("cmd") != 1:
             print(f"Handshake FAIL: {hs}")
@@ -86,8 +62,7 @@ class Resolver:
 
         # Login
         s = self._ns()
-        await self._ws.send(json.dumps({"ver": 11, "cmd": 0, "seq": s, "opcode": 19,
-                                        "payload": {"token": self.token}}, ensure_ascii=False))
+        await self._ws.send(make_msg(s, 19, {"token": self.token}))
         login = await self._recv_seq(s, timeout=15)
         if not login or login.get("cmd") != 1 or not (login.get("payload") or {}).get("profile"):
             print(f"Login FAIL")
@@ -118,10 +93,7 @@ class Resolver:
         for alias in aliases:
             s = self._ns()
             seq_to_alias[s] = alias
-            await self._ws.send(json.dumps({
-                "ver": 11, "cmd": 0, "seq": s, "opcode": 89,
-                "payload": {"link": f"https://max.ru/{alias}"}
-            }, ensure_ascii=False))
+            await self._ws.send(make_msg(s, 89, {"link": f"https://max.ru/{alias}"}))
 
         found: dict[str, int] = {}
         failed: list[str] = []

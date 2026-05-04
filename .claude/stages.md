@@ -3,6 +3,64 @@
 
 ---
 
+## [2026-05-04 13:00] — v3.7: AI-аналітика через Claude API + поліровка UI
+
+**Ключові зміни:**
+
+AI-аналітика — нова кнопка «🧠 Аналітика» ([dashboard.py](../dashboard.py), [requirements.txt](../requirements.txt), [summary.txt](../summary.txt)):
+- Кнопка активна тільки коли `q` непорожній і `period in {'24h', '7d'}`. Disabled з контекстними tooltip-ами в інших випадках.
+- Промт із [summary.txt](../summary.txt) (ТОП-5 тригерів + аналітичний висновок ~2000 символів, українською).
+- Async-task pattern як у reach: `POST /api/analytics` стартує task, `GET /api/analytics/<task_id>` опитує. Глобальний семафор `_analytics_running["busy"]` — один Claude-запит одночасно. Кеш 15 хв на `(q, channel, since_ts, until_ts)`.
+- Захист від переповнення контексту: `ANALYTICS_MAX_INPUT_CHARS=600_000` (~150k токенів), `ANALYTICS_POST_TRIM_CHARS=1500`. Серіалізатор `_build_analytics_input` обрізає довгі пости і зупиняється на ліміті.
+- Mini-renderer markdown→HTML без зовнішніх залежностей: `## заголовки`, `**bold**`, нумеровані пункти. Формат відповіді фіксований у summary.txt, тому 30 рядків regex покривають усе.
+- Конфіг через файли: `/root/.anthropic_key` (API key, chmod 600), `/root/.anthropic_gateway` (опційний base_url), `/root/.anthropic_gateway_token` (опційний CF AI Gateway токен).
+- Модель: `claude-sonnet-4-6`.
+
+Cloudflare AI Gateway — обхід гео-блоку Anthropic для RU-IP:
+- VPS у aeza маршрутизується через Moscow (попри декларований KZ), Anthropic закриває API → 403 forbidden.
+- Підтримка `base_url` через файл `.anthropic_gateway` + `default_headers={"cf-aig-authorization": "Bearer ..."}` через `.anthropic_gateway_token`.
+- Authenticated Gateway з токеном (Cloudflare AI Gateway → max-parser → native Anthropic passthrough), щоб ніхто крім нашого dashboard не міг витрачати CF-ліміти.
+- Прямий тест curl-ом: `claude-sonnet-4-6` повертає 200 через gateway.
+
+UI/UX поліровка ([dashboard.py](../dashboard.py)):
+- Кнопка «📥 Завантажити» (експорт XLSX): перероблена з form-submit на JS-навігацію `/api/export-xlsx?<window.location.search>`. Раніше hidden `period=custom` всередині `custom-dates` блоку перебивав активний preset (2 рядки в URL → Flask бере перший → `custom` без `from_date`/`to_date` → `(None, None, "all")` → експорт за весь час). Тепер експорт використовує query-параметри сторінки → саме ту вибірку, що видно.
+- Result-badge тепер містить дати в дужках поряд із period_label: «за останні 7 днів (28.04.2026 — 04.05.2026)». Helper `_format_period_dates`.
+- Заголовок «Тематична аналітика» динамічний: «Тематична аналітика за 24 години / за 7 днів / за 30 днів — військово-політична». Прибрано перемикач day/week/month — синхронізовано з основним фільтром через `_PERIOD_TO_WORDS`.
+- «Топ каналів (N)»: count унікальних каналів у дужках. Окремий запит `get_top_channels_total` з `COUNT(DISTINCT channel_title)` (бо основний `LIMIT 20`).
+- Графік «Динаміка згадок»: custom Chart.js plugin `pointValueLabelsPlugin` малює підписи прямо на канві — згадки фіолетом над кривою (`fmtBig`-аналог), охоплення блакитним під кривою (`fmtBigUA`: `тис./млн/млрд`). Локальні максимуми + крайні точки — завжди, інші ненульові — якщо вистачає місця.
+- Σ охоплення в заголовку графіка: бейдж `Σ охоплення: X.X млн переглядів` поряд з «Динаміка згадок ‹q›». Очищається при перемиканні 7д/30д/90д.
+- Reach-status повідомлення про завершення: `Охоплення зібрано та становить 20.5 млн переглядів` замість `Охоплення зібрано (постів: N)`. Об'єднано sampled і non-sampled гілки.
+- PDF-звіт повністю переписано:
+  - Шапка-блок (тимчасовий, додається першим child report-root): «МОНІТОРИНГ МЕДІА-ПРОСТОРУ МЕСЕНДЖЕРА «MAX»» + «Звіт по ключовому слову «...» · за останні 7 днів (DD.MM.YYYY — DD.MM.YYYY)».
+  - Контент масштабується на одну сторінку A4 з 5мм margin (вже не розрізається).
+  - 4 stat-плитки (Всього постів / Каналів / За годину / За 24 год) виключено з PDF через `ignoreElements`.
+
+Performance і кеш ([dashboard.py](../dashboard.py)):
+- `MAX_ROWS_SCAN`: 3 000 → 20 000 (ширша вибірка для тематичної аналітики).
+- `TOP_WORDS_CACHE_TTL`: 300с → 3600с — інакше при 10-20 хв на прорахунок кеш expired раніше ніж прогрівся.
+- Інвалідація кешу в `api_add_stop_word` уже існувала (помилково думали що нема).
+
+CSS-уніфікація — однакова ширина всіх контейнерів:
+- `--page-pad`: 1.5rem → 1.25rem.
+- Прибрано horizontal padding з layout-обгорток `.tops-grid`, `.topics-section`, `.main-grid`, `.stat-grid` — раніше вони зсували children-картки на додаткові 1.25rem всередину, через що `.post-card`, `.topic-card`, `.sidebar-card`, `.stat-card` виглядали вужчими за `search-wrap`/`result-badge`/`timeline-card`.
+- `.analytics-result` padding 1.25rem 1.5rem → 1.25rem симетричний.
+
+**Підводні камені, зафіксовані під час реалізації:**
+- Файл `summary.txt` був не задеплоєний з першою ітерацією — клік «Аналітика» падав з `[Errno 2] No such file or directory: '/root/summary.txt'`. Для майбутніх деплоїв пам'ятати: при додаванні нової фічі заливати ВСІ нові залежні файли разом.
+- Anthropic API повертає 403 з повідомленням `Request not allowed` (не `geo_restricted`) — на діагностику пішло 2 ітерації. Перевірка: `curl ipinfo.io` на VPS показала Moscow/RU.
+- Cloudflare AI Gateway за замовчуванням має ввімкнений Authenticated режим — без cf-aig-authorization токена дає `code:2009 Unauthorized` (це не Anthropic, а сам gateway).
+- `MAX_ROWS_SCAN=20_000` означає ~10-20 хв на прогрів одного періоду (NLP-pipeline ~30-60мс/пост). Після рестарту `warm_top_words_cache` йде послідовно day→week→month, повний прогрів 25-45 хв. Це ламає сприйняття «кеш має бути миттєвим».
+
+**Поточний стан:** v3.7 задеплоєна на VPS. `max-dashboard` active, AI-аналітика працює end-to-end через Cloudflare gateway. Усі контейнери дашборду візуально вирівняні. PDF-звіт на одну сторінку з шапкою.
+
+**Наступний крок:**
+1. **Disk-кеш `_top_words_cache`** — серіалізувати у файл при штатному завершенні і відновлювати при старті, щоб рестарт сервісу не убивав 30-45 хв прогріву.
+2. **Recurring refresh** — фоновий scheduler який перераховує `day` раз на годину, `week` раз на 6 год, `month` раз на добу, незалежно від користувацьких запитів.
+3. Завершити WS-рефакторинг (`ws_common.py` + `ws_parser.py`/`resolve_channels.py`) з v3.5 — досі незакомічений шар.
+4. Розглянути `GROUP BY channel_link` замість `channel_title` у `get_top_channels` — щоб канали з однаковою назвою не зливалися (відомо з v3.6).
+
+---
+
 ## [2026-05-04 10:30] — v3.6: Reach без жорсткого ліміту + alert-секція в Топ каналів
 
 **Ключові зміни:**
