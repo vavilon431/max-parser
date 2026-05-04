@@ -3,6 +3,39 @@
 
 ---
 
+## [2026-05-04 15:00] — v3.8: Session-based auth + заглушка Аналітики
+
+**Ключові зміни:**
+
+Авторизація на дашборді ([dashboard.py](../dashboard.py), [manage_auth.py](../manage_auth.py)):
+- Замість HTTP Basic Auth — повноцінна форма входу `/login` з темним стилем у дусі дашборду (фіолетовий акцент, центрована картка, focus-border).
+- Session через signed cookie, lifetime 7 днів. Secret key — `.dashboard_secret` (auto-generate при першому старті, 32 байти `secrets.token_bytes`, chmod 600).
+- Файл `.dashboard_auth` — рядки `username:pbkdf2_hash` (хеш через `werkzeug.security.generate_password_hash`). Кеш `_load_auth_users` TTL 60 с — рестарт сервісу не потрібен при додаванні юзера.
+- `before_request` гейт: пропускає `/login`, `/logout` і будь-який запит з валідною сесією. Решта: API (`/api/...`) → 401 JSON, HTML → 302 redirect на `/login?next=...` з захистом від open-redirect.
+- Routes `/login` (GET form, POST validate), `/logout` (видалення сесії). Якщо `.dashboard_auth` порожній — auth ВИМКНЕНИЙ (для локальної розробки).
+- Topbar отримав посилання `⎋ <username>` поряд з «⟳ Оновити» — клік виходить.
+- `current_user` пробрасується у `render_template_string`.
+
+CLI-helper [manage_auth.py](../manage_auth.py):
+- `add <username>` — інтерактивний `getpass` (двічі), мін. 8 символів, оновлення якщо вже існує.
+- `remove <username>`, `list`.
+- Файл пишеться з `chmod 600` автоматично, відсортований за username.
+
+Тимчасова заглушка кнопки «🧠 Аналітика» ([dashboard.py](../dashboard.py)):
+- Кнопка завжди `disabled`, tooltip «Тимчасово недоступно». JS-обробник не приєднується (через `if (!btn || btn.disabled) return`).
+- API-ендпоінти `/api/analytics`, `/api/analytics/<id>` лишились живі — UI просто без доступу. Повернути в робочий стан = одна Jinja-умова.
+
+**Поточний стан:** v3.8 задеплоєна. Auth поки вимкнений (файл `.dashboard_auth` ще не створено на VPS). Користувач має сам додати 5 акаунтів через `python3 /root/manage_auth.py add <name>`. Кнопка Аналітики прихована від користувачів.
+
+**Наступний крок:**
+1. **Користувач додає 5 акаунтів** через `manage_auth.py` на VPS — після цього auth вмикається автоматично за 60 с.
+2. **HTTPS** — поки HTTP, паролі ходять у клер. Caddy/Nginx + Let's Encrypt — окремий етап (потрібен домен).
+3. Ідеї для верхнього ряду stat-плиток (обговорено): Σ охоплення 24 год, постів-«тривог», Δ постів vs вчора, гаряче слово дня, latency останнього поста.
+4. Disk-кеш `_top_words_cache` + recurring refresh.
+5. Завершити WS-рефакторинг із v3.5.
+
+---
+
 ## [2026-05-04 14:00] — v3.7.1: PDF у білій темі + центрування stat-плиток
 
 **Ключові зміни:**

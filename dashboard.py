@@ -2,7 +2,9 @@
 MAX Parser Dashboard — Flask веб-інтерфейс для перегляду matches.db
 """
 
-from flask import Flask, render_template_string, request, jsonify, Response
+from flask import Flask, render_template_string, request, jsonify, Response, session, redirect, url_for
+from werkzeug.security import check_password_hash
+import secrets
 import sqlite3
 import re
 import random
@@ -53,6 +55,191 @@ _top_words_cache: dict[tuple[str, str], tuple[float, dict]] = {}
 _top_words_inflight: set[tuple[str, str]] = set()  # (period, channel) пари в обчисленні
 
 app = Flask(__name__)
+
+
+# ── Session-based authentication ─────────────────────────────────────────────
+# Файл `.dashboard_auth` — рядки `username:hash` (хеш робить manage_auth.py через
+# werkzeug.security.generate_password_hash). Якщо файл відсутній/порожній — auth
+# ВИМКНЕНИЙ (для локальної розробки). Сесія тримається 7 днів через signed cookie.
+# Secret key зберігається в `.dashboard_secret` (генерується при першому старті).
+
+DASHBOARD_AUTH_FILE   = Path(__file__).parent / ".dashboard_auth"
+DASHBOARD_SECRET_FILE = Path(__file__).parent / ".dashboard_secret"
+_AUTH_CACHE_TTL       = 60
+_auth_cache: tuple[float, dict[str, str]] | None = None
+_auth_lock            = threading.Lock()
+
+
+def _load_or_create_secret() -> bytes:
+    if DASHBOARD_SECRET_FILE.exists():
+        data = DASHBOARD_SECRET_FILE.read_bytes()
+        if len(data) >= 16:
+            return data
+    key = secrets.token_bytes(32)
+    DASHBOARD_SECRET_FILE.write_bytes(key)
+    try:
+        DASHBOARD_SECRET_FILE.chmod(0o600)
+    except OSError:
+        pass
+    return key
+
+
+app.secret_key = _load_or_create_secret()
+app.permanent_session_lifetime = timedelta(days=7)
+
+
+def _load_auth_users() -> dict[str, str]:
+    global _auth_cache
+    now = time.time()
+    with _auth_lock:
+        if _auth_cache and now - _auth_cache[0] < _AUTH_CACHE_TTL:
+            return _auth_cache[1]
+    users: dict[str, str] = {}
+    if DASHBOARD_AUTH_FILE.exists():
+        for line in DASHBOARD_AUTH_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or ":" not in line:
+                continue
+            user, pwhash = line.split(":", 1)
+            user = user.strip()
+            if user:
+                users[user] = pwhash.strip()
+    with _auth_lock:
+        _auth_cache = (now, users)
+    return users
+
+
+_PUBLIC_PATHS = {"/login", "/logout"}
+
+
+@app.before_request
+def _require_session_auth():
+    users = _load_auth_users()
+    if not users:                                  # auth вимкнений
+        return None
+    if request.path in _PUBLIC_PATHS:
+        return None
+    if session.get("user") in users:
+        return None
+    # API-запити отримують 401 JSON, HTML — redirect на /login
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "auth_required"}), 401
+    return redirect(url_for("login_page", next=request.full_path))
+
+
+_LOGIN_TEMPLATE = """<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Вхід — MAX Parser</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; font-family: 'Inter', system-ui, sans-serif;
+      background: #080b14; color: #c9d1d9;
+      display: flex; align-items: center; justify-content: center;
+    }
+    body::before {
+      content: ''; position: fixed; inset: 0; z-index: -1;
+      background: radial-gradient(ellipse 60% 40% at 50% 30%, rgba(108,99,255,0.18), transparent),
+                  radial-gradient(ellipse 60% 40% at 80% 80%, rgba(56,189,248,0.07), transparent);
+    }
+    .login-card {
+      width: 100%; max-width: 380px; padding: 2rem;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 16px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.4);
+    }
+    .login-title {
+      font-size: 0.7rem; font-weight: 700; color: #8b83ff;
+      text-transform: uppercase; letter-spacing: 2px; text-align: center; margin-bottom: 0.3rem;
+    }
+    .login-subtitle {
+      font-size: 1.15rem; font-weight: 700; color: #c4bfff;
+      text-align: center; margin-bottom: 1.5rem;
+    }
+    .login-error {
+      background: rgba(224,82,82,0.1); border: 1px solid rgba(224,82,82,0.3);
+      color: #ff9999; font-size: 0.85rem; padding: 0.6rem 0.85rem;
+      border-radius: 8px; margin-bottom: 1rem; text-align: center;
+    }
+    label { display: block; font-size: 0.7rem; color: #8b83a8; text-transform: uppercase;
+      letter-spacing: 1px; margin-bottom: 0.35rem; }
+    input[type="text"], input[type="password"] {
+      width: 100%; padding: 0.7rem 0.85rem; margin-bottom: 1rem;
+      background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 8px; color: #e2e0ff; font-size: 0.95rem;
+      transition: border-color 0.15s;
+    }
+    input:focus { outline: none; border-color: rgba(108,99,255,0.5); }
+    button {
+      width: 100%; padding: 0.75rem; margin-top: 0.5rem;
+      background: linear-gradient(135deg, #6c63ff, #8b83ff);
+      color: #fff; border: none; border-radius: 8px;
+      font-size: 0.95rem; font-weight: 600; cursor: pointer;
+      transition: transform 0.15s, box-shadow 0.15s;
+    }
+    button:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(108,99,255,0.35); }
+    button:active { transform: translateY(0); }
+    .login-foot {
+      text-align: center; font-size: 0.7rem; color: #4a5568; margin-top: 1.25rem;
+    }
+  </style>
+</head>
+<body>
+  <form class="login-card" method="post" action="{{ url_for('login_page') }}" autocomplete="off">
+    <div class="login-title">MAX Parser</div>
+    <div class="login-subtitle">Вхід у дашборд</div>
+    {% if error %}<div class="login-error">{{ error }}</div>{% endif %}
+    <input type="hidden" name="next" value="{{ next_url }}">
+    <label for="u">Логін</label>
+    <input id="u" name="username" type="text" required autofocus value="{{ username|e }}">
+    <label for="p">Пароль</label>
+    <input id="p" name="password" type="password" required>
+    <button type="submit">Увійти</button>
+    <div class="login-foot">Моніторинг медіа-простору</div>
+  </form>
+</body>
+</html>"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login_page():
+    users = _load_auth_users()
+    next_url = request.args.get("next") or request.form.get("next") or "/"
+    # захист від open-redirect — приймаємо тільки відносні шляхи
+    if not next_url.startswith("/") or next_url.startswith("//"):
+        next_url = "/"
+    error = None
+    username = ""
+
+    if not users:
+        # auth вимкнений (ще не створено жодного юзера) — пускаємо одразу
+        return redirect(next_url)
+
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        if username in users and check_password_hash(users[username], password):
+            session.permanent = True
+            session["user"] = username
+            return redirect(next_url)
+        error = "Невірний логін або пароль."
+
+    if session.get("user") in users and request.method == "GET":
+        return redirect(next_url)
+
+    return render_template_string(_LOGIN_TEMPLATE,
+                                  error=error, username=username, next_url=next_url)
+
+
+@app.route("/logout")
+def logout():
+    session.pop("user", None)
+    return redirect(url_for("login_page"))
+
 
 def load_custom_stops() -> set:
     if not CUSTOM_STOPS_FILE.exists():
@@ -496,6 +683,7 @@ TEMPLATE = """
     <div class="d-flex align-items-center gap-3">
       <span class="topbar-meta">{{ stats.total }} постів · {{ now }}</span>
       <a href="/" class="btn-refresh" onclick="this.textContent='оновлення...'; this.style.pointerEvents='none'">⟳ Оновити</a>
+      {% if current_user %}<a href="/logout" class="btn-refresh" title="Вийти з акаунту {{ current_user }}">⎋ {{ current_user }}</a>{% endif %}
     </div>
   </div>
 </div>
@@ -567,11 +755,9 @@ TEMPLATE = """
     <button type="submit" class="btn-search">Знайти</button>
     <button type="button" class="btn-search" id="export-xlsx-btn"
             title="Завантажити поточну вибірку в .xlsx (актуальна кількість переглядів збирається з MAX на момент завантаження)">📥 Завантажити</button>
-    {% set _analytics_ok = q and period in ['24h', '7d'] %}
-    <button type="button" class="btn-search" id="analytics-btn"
-            {% if not _analytics_ok %}disabled
-              title="{% if not q %}Доступно лише при пошуку по ключовому слову{% else %}Доступно лише для періодів «Доба» або «Тиждень»{% endif %}"
-            {% else %}title="Запустити AI-аналіз постів через Claude (5-30 с)"{% endif %}>🧠 Аналітика</button>
+    {# Тимчасова заглушка: кнопка завжди disabled до подальшого рішення #}
+    <button type="button" class="btn-search" id="analytics-btn" disabled
+            title="Тимчасово недоступно">🧠 Аналітика</button>
     <button type="button" class="btn-search" onclick="generatePDF(this)"
             title="Сформувати PDF-звіт того, що зараз на дашборді">📄 Звіт</button>
     {% if q or channel or period != '24h' %}<a href="/" class="btn-clear" title="Скинути фільтри">✕</a>{% endif %}
@@ -3015,6 +3201,7 @@ def index():
         words_period_label=words_period_label,
         sparkline_svg=sparkline_svg,
         now=now_ts,
+        current_user=session.get("user"),
     )
 
 
