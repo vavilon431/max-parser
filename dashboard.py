@@ -57,6 +57,8 @@ TEMPLATE = """
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js" defer></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     :root { --page-max: 1400px; --page-pad: 1.5rem; }
@@ -404,6 +406,8 @@ TEMPLATE = """
   </div>
 </div>
 
+<div id="report-root">
+
 <!-- Stat cards -->
 <div class="stat-grid">
   <div class="stat-card">
@@ -469,6 +473,8 @@ TEMPLATE = """
     <button type="submit" class="btn-search">Знайти</button>
     <button type="submit" class="btn-search" formaction="/api/export-xlsx"
             title="Завантажити поточну вибірку в .xlsx (актуальна кількість переглядів збирається з MAX на момент завантаження)">📥 Завантажити</button>
+    <button type="button" class="btn-search" onclick="generatePDF(this)"
+            title="Сформувати PDF-звіт того, що зараз на дашборді">📄 Звіт</button>
     {% if q or channel or period != '24h' %}<a href="/" class="btn-clear" title="Скинути фільтри">✕</a>{% endif %}
   </form>
 </div>
@@ -624,6 +630,9 @@ TEMPLATE = """
 
 
 </div>
+
+</div>
+<!-- /report-root -->
 
 <!-- Stop-word modal -->
 <div id="stop-modal" class="stop-modal-overlay">
@@ -1157,6 +1166,66 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!wrap.contains(e.target)) close();
   });
 })();
+
+// ── PDF звіт (html2canvas → jsPDF, multi-page) ──────────────────────────────
+async function generatePDF(btn) {
+  if (!window.html2canvas || !window.jspdf) {
+    alert('Бібліотеки PDF ще завантажуються — спробуй за мить.');
+    return;
+  }
+  const root = document.getElementById('report-root');
+  if (!root) return;
+
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ Готую…';
+
+  try {
+    const canvas = await html2canvas(root, {
+      scale: 2,
+      backgroundColor: '#080b14',
+      useCORS: true,
+      logging: false,
+      windowWidth: root.scrollWidth,
+      ignoreElements: (el) => {
+        if (!el.classList) return false;
+        return el.classList.contains('search-wrap')
+            || el.classList.contains('channel-ac-list')
+            || el.classList.contains('stop-btn')
+            || el.classList.contains('stop-modal-overlay');
+      }
+    });
+
+    const imgData = canvas.toDataURL('image/jpeg', 0.92);
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF({ orientation: 'p', unit: 'mm', format: 'a4' });
+    const pageW = pdf.internal.pageSize.getWidth();
+    const pageH = pdf.internal.pageSize.getHeight();
+    const imgH = canvas.height * pageW / canvas.width;
+
+    let heightLeft = imgH;
+    let position = 0;
+    pdf.addImage(imgData, 'JPEG', 0, position, pageW, imgH);
+    heightLeft -= pageH;
+    while (heightLeft > 0) {
+      position = heightLeft - imgH;       // негативний зсув — "розрізаємо" одну довгу картинку на сторінки
+      pdf.addPage();
+      pdf.addImage(imgData, 'JPEG', 0, position, pageW, imgH);
+      heightLeft -= pageH;
+    }
+
+    const d = new Date();
+    const pad = n => String(n).padStart(2,'0');
+    const ts = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}`;
+    pdf.save(`max_report_${ts}.pdf`);
+  } catch (err) {
+    console.error('[report] failed:', err);
+    alert('Не вдалось сформувати звіт: ' + (err && err.message || err));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
 </script>
 </body>
 </html>
