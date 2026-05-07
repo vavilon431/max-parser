@@ -2,6 +2,11 @@
 .login_token
 .device_id
 .env
+.dashboard_secret
+.dashboard_auth
+.anthropic_key
+.anthropic_gateway
+.anthropic_gateway_token
 *.key
 *.pem
 
