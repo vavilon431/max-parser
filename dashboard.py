@@ -4,6 +4,7 @@ MAX Parser Dashboard — Flask веб-інтерфейс для перегляд
 
 from flask import Flask, render_template_string, request, jsonify, Response, session, redirect, url_for
 from werkzeug.security import check_password_hash
+import os
 import secrets
 import sqlite3
 import re
@@ -33,9 +34,24 @@ CUSTOM_STOPS_FILE         = Path(__file__).parent / "custom_stop_words.txt"
 ALERT_CHANNELS_FILE       = Path(__file__).parent / "channels" / "alert_channels.txt"
 TOP_WORDS_CACHE_TTL       = 3600   # 1 год — прорахунок на 20k постів коштує дорого
 BASELINE_REBUILD_INTERVAL = 24 * 3600
-# NER+syntax pipeline ~30-60ms/пост → перший прорахунок ~10-20 хв на 20k постах,
-# тому API повертає миттєво (кеш або порожньо + фоновий тред), JS перепитує.
+# NER pipeline ~20-40ms/пост (без syntax) → перший прорахунок ~7-14 хв на 20k постах
+# для FALLBACK-шляху. Основний шлях — інкрементальний кеш (`message_lemmas`),
+# який наповнює `lemma_cache_scheduler` у фоні; запит "топ за 24h" з кеша = мс.
 MAX_ROWS_SCAN             = 20_000
+
+# Інкрементальний кеш лем
+LEMMA_CACHE_BATCH_SIZE    = 200    # постів за один прохід обробки
+LEMMA_CACHE_INTERVAL      = 30     # секунд між проходами (idle)
+LEMMA_CACHE_BUSY_INTERVAL = 1      # секунд між проходами поки є pending
+LEMMA_CACHE_MIN_COVERAGE  = 0.80   # % постів періоду які мусять бути в кеші,
+                                    # щоб не падати в on-the-fly fallback
+# Multi-core обробка кеша через ProcessPoolExecutor.
+# Кожен worker тримає Natasha (~600 МБ RAM), тож обережно: env override.
+# 1 = sequential (за замовчуванням, безпечно для VPS з 800 МБ ліміту).
+try:
+    LEMMA_CACHE_WORKERS = max(1, int(os.environ.get("MAX_PARSER_NLP_WORKERS", "1")))
+except ValueError:
+    LEMMA_CACHE_WORKERS = 1
 
 # AI-аналітика через Claude API
 ANTHROPIC_KEY_FILE        = Path(__file__).parent / ".anthropic_key"
@@ -717,17 +733,19 @@ TEMPLATE = """
 <!-- Search -->
 <div class="search-wrap" style="max-width: var(--page-max); margin: 0 auto 1rem; padding: 1rem 1.25rem;">
   <form method="get" id="search-form" class="d-flex gap-2 flex-wrap">
+    <!-- Єдине джерело правди про period для всієї форми; чіпи лише оновлюють це поле -->
+    <input type="hidden" name="period" id="period-hidden" value="{{ period }}">
+
     <!-- Ряд 1: пресет-чіпи -->
     <div class="preset-chips" style="width:100%">
       {% for p, label in [('1h','Година'),('24h','Доба'),('7d','Тиждень'),('30d','Місяць'),('all','Весь час')] %}
-      <button type="submit" name="period" value="{{ p }}" class="preset-chip {% if period==p %}active{% endif %}">{{ label }}</button>
+      <button type="button" data-period="{{ p }}" class="preset-chip period-chip {% if period==p %}active{% endif %}">{{ label }}</button>
       {% endfor %}
-      <button type="button" class="preset-chip {% if period=='custom' %}active{% endif %}" onclick="toggleCustomDates()">📅 Інше</button>
+      <button type="button" id="period-chip-custom" class="preset-chip {% if period=='custom' %}active{% endif %}" onclick="toggleCustomDates()">📅 Інше</button>
     </div>
 
     <!-- Ряд 2: кастомний діапазон (схований за замовчуванням) -->
     <div id="custom-dates" class="custom-dates {% if period=='custom' %}show{% endif %}" style="width:100%">
-      <input type="hidden" name="period" value="custom">
       <input type="date" name="from_date" class="form-control" value="{{ from_date }}" style="flex:0 0 auto">
       <span class="dash-sep">—</span>
       <input type="date" name="to_date"   class="form-control" value="{{ to_date }}"   style="flex:0 0 auto">
@@ -760,7 +778,12 @@ TEMPLATE = """
             title="Тимчасово недоступно">🧠 Аналітика</button>
     <button type="button" class="btn-search" onclick="generatePDF(this)"
             title="Сформувати PDF-звіт того, що зараз на дашборді">📄 Звіт</button>
-    {% if q or channel or period != '24h' %}<a href="/" class="btn-clear" title="Скинути фільтри">✕</a>{% endif %}
+    {# Скидаємо лише q+channel, period (і from/to для custom) лишаємо поточним. #}
+    {% if q or channel %}
+      {% set _clear_qs = '?period=' ~ period %}
+      {% if period == 'custom' %}{% set _clear_qs = _clear_qs ~ '&from_date=' ~ from_date ~ '&to_date=' ~ to_date %}{% endif %}
+      <a href="/{{ _clear_qs }}" class="btn-clear" title="Скинути запит і канал (період зберігається)">✕</a>
+    {% endif %}
   </form>
 </div>
 
@@ -963,8 +986,31 @@ TEMPLATE = """
 <script>
 function toggleCustomDates() {
   const block = document.getElementById('custom-dates');
-  block.classList.toggle('show');
+  const opened = block.classList.toggle('show');
+  // При відкритті custom-блоку фіксуємо period=custom, щоб submit "Застосувати"
+  // не передавав попереднє значення (24h/7d тощо).
+  if (opened) {
+    const hidden = document.getElementById('period-hidden');
+    if (hidden) hidden.value = 'custom';
+    document.querySelectorAll('.preset-chip').forEach(b => b.classList.remove('active'));
+    const customChip = document.getElementById('period-chip-custom');
+    if (customChip) customChip.classList.add('active');
+  }
 }
+
+// Чіпи періоду: змінюють приховане поле і одразу сабмітять форму. Через це
+// кнопки "Знайти" / "Застосувати" зберігають поточний period замість дефолтного.
+document.addEventListener('DOMContentLoaded', () => {
+  const hidden = document.getElementById('period-hidden');
+  const form   = document.getElementById('search-form');
+  document.querySelectorAll('.period-chip[data-period]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (!hidden || !form) return;
+      hidden.value = btn.dataset.period;
+      form.submit();
+    });
+  });
+});
 
 let _currentPeriod = {{ words_period|tojson }};
 const _TOPIC_CATS = ['per','loc','org','term'];
@@ -1912,13 +1958,44 @@ def parse_time_filter(period: str, from_date: str, to_date: str) -> tuple[str | 
 _FTS_OPERATORS_RE = re.compile(r'\b(AND|OR|NOT|NEAR)\b|["():]', re.IGNORECASE)
 _FTS_TOKEN_RE     = re.compile(r'[\w*]+', re.UNICODE)
 
+# Snowball-стемер для російської — rule-based, без зовнішніх ресурсів.
+# Потрібен щоб "зеленский" -> "зеленск*" (а не "зеленский*"), бо префіксний пошук
+# у FTS5 матчить тільки токени що починаються з префікса; форми "зеленского",
+# "зеленскому" не починаються на "зеленский" і ловляться лише через stem.
+try:
+    from nltk.stem.snowball import SnowballStemmer
+    _RU_STEMMER = SnowballStemmer("russian")
+except Exception:
+    _RU_STEMMER = None
+
+# Мінімальна довжина stem-у. Якщо стемер видав щось коротше (рідко: дуже короткі
+# службові слова) — використовуємо оригінальний токен, щоб не отримати "ид*" з "идти".
+_MIN_STEM_LEN = 4
+
+
+def _stem_for_search(token: str) -> str:
+    """Stem російського токена для префіксного пошуку. Повертає оригінал,
+    якщо стемер недоступний, токен короткий, або stem занадто короткий."""
+    if _RU_STEMMER is None:
+        return token
+    if len(token) <= _MIN_STEM_LEN:
+        return token
+    if not any('а' <= c <= 'я' or c == 'ё' for c in token.lower()):
+        return token  # не-кирилиця: цифри, латиниця, тощо — не стемимо
+    try:
+        s = _RU_STEMMER.stem(token.lower())
+    except Exception:
+        return token
+    return s if len(s) >= _MIN_STEM_LEN else token
+
+
 def build_fts_query(q: str) -> str:
     """
     Перетворює користувацький ввід у безпечний FTS5 query.
     - Якщо q містить FTS-оператори (AND/OR/NOT/NEAR, лапки, дужки) — передаємо as-is.
-    - Інакше — розбиваємо на токени і додаємо * для префіксного пошуку, щоб
-      «путин» знаходив «Путина», «Путиным», «путинский» (російська морфологія).
-    - Якщо користувач уже поставив *, не дублюємо.
+    - Інакше — розбиваємо на токени, проганяємо через Snowball-стемер і додаємо *
+      для префіксного пошуку. «зеленский» → «зеленск*», ловить усі словоформи.
+    - Якщо користувач уже поставив * — не стемимо і не дублюємо (явний намір).
     - AND-логіка між токенами (дефолт FTS5).
     """
     q = q.strip()
@@ -1934,7 +2011,8 @@ def build_fts_query(q: str) -> str:
         if t.endswith("*"):
             result.append(t)
         else:
-            result.append(f"{t}*")
+            stem = _stem_for_search(t)
+            result.append(f"{stem}*")
     return " ".join(result)
 
 _STATS_CACHE_TTL = 30
@@ -2582,15 +2660,33 @@ _EMPTY_TOP = {c: [] for c in nlp_mod.CATEGORIES}
 
 def _compute_top_words_blocking(period: str, channel: str = "") -> dict:
     """Реальне обчислення (NER+TF-IDF). Викликається у фоновому thread.
-    Якщо channel — рахує тільки по постах цього каналу (channel_title)."""
+    Якщо channel — рахує тільки по постах цього каналу (channel_title).
+
+    Стратегія:
+      1) Спочатку читаємо TF з `message_lemmas` (агрегатний SQL — мс).
+      2) Якщо кеш покриває >= LEMMA_CACHE_MIN_COVERAGE постів періоду — повертаємо.
+      3) Інакше — fallback на старий on-the-fly NER (з дедуплікацією).
+    Background scheduler (`lemma_cache_scheduler`) у будь-якому разі догризає
+    pending-пости, тож наступні запити будуть швидші.
+    """
     delta = {"day": timedelta(days=1), "week": timedelta(weeks=1), "month": timedelta(days=30)}
     since = (datetime.now() - delta.get(period, timedelta(days=1))).strftime("%Y-%m-%d %H:%M:%S")
     extra_stops = EXTRA_STOPS | load_custom_stops()
     db = get_db()
     try:
-        tf_period = nlp_mod.compute_period_tf(
-            db, since, MAX_ROWS_SCAN, extra_stops, channel=channel or None
+        tf_period, done_in_period, total_in_period = nlp_mod.compute_period_tf_from_cache(
+            db, since, extra_stops=extra_stops, channel=channel or None
         )
+        coverage = (done_in_period / total_in_period) if total_in_period else 1.0
+        if total_in_period and coverage < LEMMA_CACHE_MIN_COVERAGE:
+            print(f"[top-words] cache coverage {coverage:.0%} ({done_in_period}/{total_in_period}) "
+                  f"< {LEMMA_CACHE_MIN_COVERAGE:.0%}; fallback на on-the-fly NER", flush=True)
+            tf_period = nlp_mod.compute_period_tf(
+                db, since, MAX_ROWS_SCAN, extra_stops, channel=channel or None
+            )
+        else:
+            print(f"[top-words] from cache: coverage={coverage:.0%} "
+                  f"({done_in_period}/{total_in_period} постів)", flush=True)
         baseline_df, n_baseline = _get_baseline_snapshot(db)
     finally:
         db.close()
@@ -2724,6 +2820,65 @@ def warm_top_words_cache():
     threading.Thread(target=_warm, daemon=True).start()
 
 
+def lemma_cache_scheduler():
+    """Фоновий потік: інкрементально наповнює `message_lemmas` для нових постів.
+
+    Стратегія пріоритету:
+      - Спершу обробляємо пости періоду "за 24 години" (top-words основний UX).
+      - Коли цей період повністю в кеші — догризаємо решту бази (week, month, ...).
+      - Коли все оброблено — спимо LEMMA_CACHE_INTERVAL до наступного проходу.
+
+    Workers контролюються env-змінною `MAX_PARSER_NLP_WORKERS`. У `1` (default)
+    обробка sequential і безпечна по RAM. >1 запускає ProcessPoolExecutor —
+    кожен worker тримає Natasha-моделі (~600 МБ); підняти ліміт у systemd.
+    """
+    def _loop():
+        time.sleep(8)  # дати warm_top_words_cache стартонути першим
+        # Перший прохід — лога-friendly статус.
+        db = get_db()
+        try:
+            done, total = nlp_mod.lemma_cache_progress(db)
+            print(f"[lemma-cache] стартую: {done}/{total} постів вже в кеші, "
+                  f"workers={LEMMA_CACHE_WORKERS}", flush=True)
+        finally:
+            db.close()
+
+        while True:
+            try:
+                extra_stops = EXTRA_STOPS | load_custom_stops()
+                # Пріоритет — період останньої доби.
+                since_24h = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+                db = get_db()
+                try:
+                    t0 = time.time()
+                    n = nlp_mod.process_messages_batch(
+                        db, LEMMA_CACHE_BATCH_SIZE, extra_stops,
+                        since=since_24h, n_workers=LEMMA_CACHE_WORKERS
+                    )
+                    if n == 0:
+                        # 24h в кеші — добираємо решту (без `since`).
+                        n = nlp_mod.process_messages_batch(
+                            db, LEMMA_CACHE_BATCH_SIZE, extra_stops,
+                            since=None, n_workers=LEMMA_CACHE_WORKERS
+                        )
+                    if n > 0:
+                        elapsed = time.time() - t0
+                        rate = n / elapsed if elapsed > 0 else 0.0
+                        done, total = nlp_mod.lemma_cache_progress(db)
+                        print(f"[lemma-cache] +{n} постів за {elapsed:.1f}с "
+                              f"({rate:.1f}/с) → {done}/{total}", flush=True)
+                finally:
+                    db.close()
+
+                # Якщо щось обробили — швидко далі; інакше пауза.
+                time.sleep(LEMMA_CACHE_BUSY_INTERVAL if n > 0 else LEMMA_CACHE_INTERVAL)
+            except Exception as e:
+                print(f"[lemma-cache] error: {e}", flush=True)
+                time.sleep(LEMMA_CACHE_INTERVAL)
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 @app.route("/api/add-stop-word", methods=["POST"])
 def api_add_stop_word():
     word = (request.json or {}).get("word", "").strip().lower()
@@ -2732,6 +2887,16 @@ def api_add_stop_word():
     existing = load_custom_stops()
     if word not in existing:
         save_custom_stop(word)
+    # Видаляємо лему з інкрементального кеша — інакше вона ще покажеться у топі
+    # до повного перебору. Робимо в окремому коннекті, не блокуючи відповідь надовго.
+    db = get_db()
+    try:
+        deleted = nlp_mod.purge_lemma_from_cache(db, word)
+    finally:
+        db.close()
+    if deleted:
+        print(f"[stop-word] '{word}': видалено {deleted} рядків з {nlp_mod.LEMMA_CACHE_TABLE}",
+              flush=True)
     with _top_words_lock:
         _top_words_cache.clear()
     return jsonify({"ok": True, "word": word})
@@ -3207,10 +3372,12 @@ def index():
 
 if __name__ == "__main__":
     _init_db = get_db()
-    init_fts(_init_db)                      # FTS5 virtual table + triggers + bootstrap
-    nlp_mod.init_baseline_schema(_init_db)  # baseline tables
+    init_fts(_init_db)                         # FTS5 virtual table + triggers + bootstrap
+    nlp_mod.init_baseline_schema(_init_db)     # baseline tables
+    nlp_mod.init_lemma_cache_schema(_init_db)  # message_lemmas + done-таблиця
     _init_db.close()
 
     baseline_scheduler()
     warm_top_words_cache()
+    lemma_cache_scheduler()
     app.run(host="0.0.0.0", port=8080, debug=False, threaded=True)

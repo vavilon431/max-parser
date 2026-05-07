@@ -3,25 +3,35 @@ NLP-пайплайн для дашборда: токенізація, лемма
 TF-IDF скорінг проти baseline.
 
 Архітектура:
-- Natasha завантажується ледаче — moduly не займають RAM поки не викликають tokenize.
+- Natasha завантажується ледаче — модулі не займають RAM поки не викликають tokenize.
 - 4 категорії на виході токенайзера: per (персони), loc (локації), org (організації),
   term (тематичні леми, чий корінь є у topical_roots.txt).
 - Baseline у SQLite з ключем "category::lemma" (у тій самій таблиці).
 - Скорінг: TF-IDF проти baseline — `(1 + log tf) × log((N+1)/(df+1))`.
+
+Швидкісні оптимізації:
+- `parse_syntax` вилучено з пайплайна (було ~30% часу, ніде не використовувалось).
+- `is_topical` через `startswith(tuple)` — нативний C-цикл замість Python any().
+- Інкрементальний кеш лем у таблиці `message_lemmas` — NER кожного поста рахується
+  один раз за все життя; запит "топ за період" перетворюється на GROUP BY у SQL.
+- Дедуплікація за hash тексту перед NER — репости одного посту обробляються один раз.
+- Multi-core опційно через `process_messages_batch_parallel` (ProcessPoolExecutor).
 """
 from __future__ import annotations
 
+import hashlib
 import math
+import os
 import sqlite3
 import threading
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
 # ── Natasha ledge-load ───────────────────────────────────────────────────────
 
 _pipeline_lock = threading.Lock()
-_pipeline = None  # tuple(segmenter, morph_vocab, morph_tagger, syntax_parser, ner_tagger) або False
+_pipeline = None  # tuple(segmenter, morph_vocab, morph_tagger, ner_tagger) або False
 
 # Без VERB — дієслова в "топ слів" військово-політичного дашборду майже ніколи
 # не несуть користі (прислать/сообщать/пояснять забивають топ).
@@ -70,17 +80,23 @@ def reload_topical_roots() -> int:
 
 
 def is_topical(lemma: str) -> bool:
-    """Перевіряє чи починається лема з одного з тематичних коренів."""
+    """Перевіряє чи починається лема з одного з тематичних коренів.
+    Використовує `str.startswith(tuple)` — це нативний C-цикл, в рази швидше
+    за Python `any(lemma.startswith(r) for r in roots)`.
+    """
     roots = _load_topical_roots()
     if not roots:
         return True  # fallback: якщо файла немає, не фільтруємо
-    return any(lemma.startswith(r) for r in roots)
+    return lemma.startswith(roots)
 
 
 # ── Pipeline init ────────────────────────────────────────────────────────────
 
 def _init_pipeline():
-    """Ледача ініціалізація Natasha (segment+morph+syntax+ner). Викликається раз."""
+    """Ледача ініціалізація Natasha (segment+morph+ner). Викликається раз.
+    `parse_syntax` свідомо вилучено: було ~30% часу пайплайна, але ніде не
+    використовується — NER працює на embeddings, POS-фільтр бере дані з morph.
+    """
     global _pipeline
     with _pipeline_lock:
         if _pipeline is not None:
@@ -88,16 +104,15 @@ def _init_pipeline():
         try:
             from natasha import (
                 Segmenter, MorphVocab, NewsEmbedding,
-                NewsMorphTagger, NewsSyntaxParser, NewsNERTagger,
+                NewsMorphTagger, NewsNERTagger,
             )
             segmenter = Segmenter()
             morph_vocab = MorphVocab()
             emb = NewsEmbedding()
             morph_tagger = NewsMorphTagger(emb)
-            syntax_parser = NewsSyntaxParser(emb)
             ner_tagger = NewsNERTagger(emb)
-            _pipeline = (segmenter, morph_vocab, morph_tagger, syntax_parser, ner_tagger)
-            print("[nlp] Natasha pipeline (morph+syntax+ner) готовий", flush=True)
+            _pipeline = (segmenter, morph_vocab, morph_tagger, ner_tagger)
+            print("[nlp] Natasha pipeline (morph+ner, без syntax) готовий", flush=True)
         except Exception as e:
             print(f"[nlp] Natasha init failed: {e}", flush=True)
             _pipeline = False
@@ -133,14 +148,13 @@ def tokenize_categorized(text: str, extra_stops: set[str] | None = None
         return empty
 
     from natasha import Doc
-    segmenter, morph_vocab, morph_tagger, syntax_parser, ner_tagger = pipeline
+    segmenter, morph_vocab, morph_tagger, ner_tagger = pipeline
     stops = extra_stops or set()
 
     try:
         doc = Doc(text)
         doc.segment(segmenter)
         doc.tag_morph(morph_tagger)
-        doc.parse_syntax(syntax_parser)
         doc.tag_ner(ner_tagger)
     except Exception:
         return empty
@@ -188,6 +202,19 @@ def tokenize_categorized(text: str, extra_stops: set[str] | None = None
     return out
 
 
+def tokenize_aggregated(text: str, extra_stops: set[str] | None = None
+                        ) -> dict[tuple[str, str], int]:
+    """Те саме що tokenize_categorized, але одразу агрегує за (cat, lemma) → count.
+    Зручно для запису у message_lemmas одним рядком на унікальну пару."""
+    cats = tokenize_categorized(text, extra_stops)
+    agg: dict[tuple[str, str], int] = {}
+    for cat in CATEGORIES:
+        for lemma in cats[cat]:
+            key = (cat, lemma)
+            agg[key] = agg.get(key, 0) + 1
+    return agg
+
+
 def tokenize_lemmas(text: str, extra_stops: set[str] | None = None) -> list[str]:
     """
     Legacy-сумісність: плаский список усіх лем (per+loc+org+term) з префіксом
@@ -206,6 +233,11 @@ def tokenize_lemmas(text: str, extra_stops: set[str] | None = None) -> list[str]
 BASELINE_TABLE    = "baseline_lemma_freq"
 BASELINE_META_KEY = "n_docs"
 
+# ── Інкрементальний кеш лем для постів ───────────────────────────────────────
+
+LEMMA_CACHE_TABLE = "message_lemmas"        # (msg_id, category, lemma, n)
+LEMMA_DONE_TABLE  = "message_lemmas_done"   # (msg_id) — мітка обробки (включно з порожніми)
+
 
 def init_baseline_schema(db: sqlite3.Connection):
     db.execute(f"""
@@ -222,6 +254,60 @@ def init_baseline_schema(db: sqlite3.Connection):
             value TEXT NOT NULL
         )
     """)
+    db.commit()
+
+
+def init_lemma_cache_schema(db: sqlite3.Connection):
+    """Таблиці інкрементального кеша лем. Ідемпотентно.
+    `message_lemmas` — одна стрічка на унікальну (msg_id, category, lemma) з лічильником.
+    `message_lemmas_done` — мітка що пост оброблено (навіть якщо лем 0).
+    """
+    db.execute(f"""
+        CREATE TABLE IF NOT EXISTS {LEMMA_CACHE_TABLE} (
+            msg_id   INTEGER NOT NULL,
+            category TEXT    NOT NULL,
+            lemma    TEXT    NOT NULL,
+            n        INTEGER NOT NULL,
+            PRIMARY KEY (msg_id, category, lemma)
+        )
+    """)
+    db.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{LEMMA_CACHE_TABLE}_lemma "
+        f"ON {LEMMA_CACHE_TABLE}(category, lemma)"
+    )
+    db.execute(f"""
+        CREATE TABLE IF NOT EXISTS {LEMMA_DONE_TABLE} (
+            msg_id INTEGER PRIMARY KEY
+        )
+    """)
+    db.commit()
+
+
+def lemma_cache_progress(db: sqlite3.Connection) -> tuple[int, int]:
+    """Повертає (оброблено_постів, всього_постів) для UI/логів."""
+    try:
+        done = db.execute(f"SELECT COUNT(*) FROM {LEMMA_DONE_TABLE}").fetchone()[0]
+        total = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        return int(done), int(total)
+    except sqlite3.OperationalError:
+        return 0, 0
+
+
+def purge_lemma_from_cache(db: sqlite3.Connection, lemma: str) -> int:
+    """Видаляє лему з кеша (всі категорії). Викликається після додавання стоп-слова.
+    Повертає кількість видалених рядків."""
+    cur = db.execute(
+        f"DELETE FROM {LEMMA_CACHE_TABLE} WHERE lemma = ?", (lemma,)
+    )
+    db.commit()
+    return cur.rowcount or 0
+
+
+def reset_lemma_cache(db: sqlite3.Connection):
+    """Повне скидання кеша. Використовується якщо помінявся набір тематичних
+    коренів і треба все переробити з нуля."""
+    db.execute(f"DELETE FROM {LEMMA_CACHE_TABLE}")
+    db.execute(f"DELETE FROM {LEMMA_DONE_TABLE}")
     db.commit()
 
 
@@ -274,19 +360,28 @@ def build_baseline(db: sqlite3.Connection, days_back: int = 30,
     if not rows:
         return 0, 0
 
+    # Дедуплікація: репости одного тексту — один прохід через NER.
+    unique_texts: dict[str, list[str]] = defaultdict(list)
+    for (text,) in rows:
+        h = hashlib.blake2b((text or "").encode("utf-8"), digest_size=16).hexdigest()
+        unique_texts[h].append(text or "")
+
     key_df: Counter = Counter()
     key_tf: Counter = Counter()
     n_docs = 0
 
-    for (text,) in rows:
-        keys = tokenize_lemmas(text, extra_stops)
+    for h, texts in unique_texts.items():
+        keys = tokenize_lemmas(texts[0], extra_stops)
+        dup = len(texts)
+        n_docs += dup
         if not keys:
             continue
-        n_docs += 1
-        for k in set(keys):
-            key_df[k] += 1
-        for k in keys:
-            key_tf[k] += 1
+        unique_keys = set(keys)
+        for k in unique_keys:
+            key_df[k] += dup
+        per_text_tf: Counter = Counter(keys)
+        for k, c in per_text_tf.items():
+            key_tf[k] += c * dup
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.execute(f"DELETE FROM {BASELINE_TABLE}")
@@ -342,15 +437,245 @@ def score_top_categorized(tf_period: dict[str, int],
     return by_cat
 
 
+# ── Інкрементальна обробка постів у фоні ─────────────────────────────────────
+
+def _select_pending_msgs(db: sqlite3.Connection, batch_size: int,
+                         since: str | None = None
+                         ) -> list[tuple[int, str]]:
+    """Бере пости яких ще нема в `message_lemmas_done`. Якщо since задано —
+    обмежує цим періодом (для пріоритетного прогріву "за 24h")."""
+    if since:
+        sql = (
+            f"SELECT m.id, m.text FROM messages m "
+            f"LEFT JOIN {LEMMA_DONE_TABLE} d ON d.msg_id = m.id "
+            f"WHERE d.msg_id IS NULL AND m.saved_at >= ? "
+            f"ORDER BY m.id DESC LIMIT ?"
+        )
+        rows = db.execute(sql, (since, batch_size)).fetchall()
+    else:
+        sql = (
+            f"SELECT m.id, m.text FROM messages m "
+            f"LEFT JOIN {LEMMA_DONE_TABLE} d ON d.msg_id = m.id "
+            f"WHERE d.msg_id IS NULL "
+            f"ORDER BY m.id DESC LIMIT ?"
+        )
+        rows = db.execute(sql, (batch_size,)).fetchall()
+    return [(int(r[0]), r[1] or "") for r in rows]
+
+
+def _persist_batch_results(db: sqlite3.Connection,
+                           msg_ids: list[int],
+                           results_by_id: dict[int, dict[tuple[str, str], int]]):
+    """Записує результати NER одного batch-у у `message_lemmas` + мітки в `_done`."""
+    rows: list[tuple[int, str, str, int]] = []
+    for mid in msg_ids:
+        agg = results_by_id.get(mid, {})
+        for (cat, lemma), n in agg.items():
+            rows.append((mid, cat, lemma, n))
+    if rows:
+        db.executemany(
+            f"INSERT OR REPLACE INTO {LEMMA_CACHE_TABLE}"
+            f"(msg_id, category, lemma, n) VALUES (?, ?, ?, ?)",
+            rows
+        )
+    db.executemany(
+        f"INSERT OR IGNORE INTO {LEMMA_DONE_TABLE}(msg_id) VALUES (?)",
+        [(mid,) for mid in msg_ids]
+    )
+    db.commit()
+
+
+def _process_with_dedup(items: list[tuple[int, str]],
+                        extra_stops: set[str] | None
+                        ) -> dict[int, dict[tuple[str, str], int]]:
+    """Sequential-варіант. Дедуплікує тексти за blake2b-hash, проганяє Natasha
+    один раз на унікальний текст, копіює результат на всі msg_id."""
+    by_hash_msgs: dict[str, list[int]] = defaultdict(list)
+    by_hash_text: dict[str, str] = {}
+    for mid, text in items:
+        h = hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
+        by_hash_msgs[h].append(mid)
+        if h not in by_hash_text:
+            by_hash_text[h] = text
+
+    results: dict[int, dict[tuple[str, str], int]] = {}
+    for h, mids in by_hash_msgs.items():
+        text = by_hash_text[h]
+        if not text.strip():
+            for mid in mids:
+                results[mid] = {}
+            continue
+        agg = tokenize_aggregated(text, extra_stops)
+        for mid in mids:
+            results[mid] = agg
+    return results
+
+
+# ProcessPool worker — module-level, щоб pickle-нувся.
+
+_worker_stops: set[str] | None = None
+
+
+def _worker_init(stops: set[str] | None):
+    """Викликається в дочірньому процесі один раз. Прогріває Natasha-пайплайн
+    і зберігає stop-set в global для подальших викликів _worker_run."""
+    global _worker_stops
+    _worker_stops = stops or set()
+    _init_pipeline()
+
+
+def _worker_run(text: str) -> dict[tuple[str, str], int]:
+    """Викликається на кожному унікальному тексті у дочірньому процесі."""
+    return tokenize_aggregated(text, _worker_stops)
+
+
+def _process_with_pool(items: list[tuple[int, str]],
+                       extra_stops: set[str] | None,
+                       n_workers: int
+                       ) -> dict[int, dict[tuple[str, str], int]]:
+    """Multi-core варіант з ProcessPoolExecutor. Дедуплікує тексти і шарить
+    обчислення між n_workers. Кожен worker тримає Natasha-пайплайн у пам'яті
+    (тому оверхед — лише на холодний старт пула)."""
+    from concurrent.futures import ProcessPoolExecutor
+
+    by_hash_msgs: dict[str, list[int]] = defaultdict(list)
+    by_hash_text: dict[str, str] = {}
+    for mid, text in items:
+        h = hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
+        by_hash_msgs[h].append(mid)
+        if h not in by_hash_text:
+            by_hash_text[h] = text
+
+    hashes = [h for h, t in by_hash_text.items() if t.strip()]
+    texts = [by_hash_text[h] for h in hashes]
+
+    results: dict[int, dict[tuple[str, str], int]] = {}
+    if not texts:
+        for mids in by_hash_msgs.values():
+            for mid in mids:
+                results[mid] = {}
+        return results
+
+    with ProcessPoolExecutor(max_workers=n_workers,
+                              initializer=_worker_init,
+                              initargs=(extra_stops,)) as ex:
+        for h, agg in zip(hashes, ex.map(_worker_run, texts, chunksize=4)):
+            for mid in by_hash_msgs[h]:
+                results[mid] = agg
+
+    # Тексти з порожнім stripped — не пройшли в pool, маркуємо як оброблені з {}.
+    for h, t in by_hash_text.items():
+        if not t.strip():
+            for mid in by_hash_msgs[h]:
+                results[mid] = {}
+    return results
+
+
+def process_messages_batch(db: sqlite3.Connection,
+                           batch_size: int,
+                           extra_stops: set[str] | None = None,
+                           since: str | None = None,
+                           n_workers: int = 1) -> int:
+    """Обробляє наступну партію постів які ще не в кеші.
+    `since` — пріоритезувати пости з періоду (для прогріву "24h" спершу).
+    `n_workers` — 1 (sequential, default) або >1 (ProcessPoolExecutor).
+    Повертає кількість оброблених постів (0 — більше нема pending)."""
+    if not nlp_available():
+        return 0
+    items = _select_pending_msgs(db, batch_size, since=since)
+    if not items:
+        return 0
+
+    if n_workers > 1:
+        results = _process_with_pool(items, extra_stops, n_workers)
+    else:
+        results = _process_with_dedup(items, extra_stops)
+
+    msg_ids = [mid for mid, _ in items]
+    _persist_batch_results(db, msg_ids, results)
+    return len(items)
+
+
+# ── TF за період: швидко з кеша + fallback на on-the-fly ─────────────────────
+
+def compute_period_tf_from_cache(db: sqlite3.Connection,
+                                 since: str,
+                                 extra_stops: set[str] | None = None,
+                                 channel: str | None = None
+                                 ) -> tuple[dict[str, int], int, int]:
+    """Читає TF з `message_lemmas` за період (агрегатний SQL — мікросекунди).
+    Поверне ({"category::lemma": tf}, постів_у_кеші, постів_всього_у_періоді).
+
+    `extra_stops` фільтруються на льоту (важливо: коли користувач додає стоп через
+    UI, нові леми ще можуть лишитись у кеші до наступного `purge_lemma_from_cache`,
+    тому перестраховуємось і тут).
+    """
+    stops = extra_stops or set()
+
+    if channel:
+        sql = (
+            f"SELECT l.category, l.lemma, SUM(l.n) AS tf "
+            f"FROM {LEMMA_CACHE_TABLE} l "
+            f"JOIN messages m ON m.id = l.msg_id "
+            f"WHERE m.saved_at >= ? AND m.channel_title = ? "
+            f"GROUP BY l.category, l.lemma"
+        )
+        params: tuple = (since, channel)
+
+        sql_done = (
+            f"SELECT COUNT(*) FROM messages m "
+            f"JOIN {LEMMA_DONE_TABLE} d ON d.msg_id = m.id "
+            f"WHERE m.saved_at >= ? AND m.channel_title = ?"
+        )
+        sql_total = (
+            "SELECT COUNT(*) FROM messages "
+            "WHERE saved_at >= ? AND channel_title = ?"
+        )
+    else:
+        sql = (
+            f"SELECT l.category, l.lemma, SUM(l.n) AS tf "
+            f"FROM {LEMMA_CACHE_TABLE} l "
+            f"JOIN messages m ON m.id = l.msg_id "
+            f"WHERE m.saved_at >= ? "
+            f"GROUP BY l.category, l.lemma"
+        )
+        params = (since,)
+        sql_done = (
+            f"SELECT COUNT(*) FROM messages m "
+            f"JOIN {LEMMA_DONE_TABLE} d ON d.msg_id = m.id "
+            f"WHERE m.saved_at >= ?"
+        )
+        sql_total = "SELECT COUNT(*) FROM messages WHERE saved_at >= ?"
+
+    counter: Counter = Counter()
+    try:
+        rows = db.execute(sql, params).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+
+    for cat, lemma, tf in rows:
+        if not cat or not lemma:
+            continue
+        if lemma in stops:
+            continue
+        counter[f"{cat}{_KEY_SEP}{lemma}"] += int(tf)
+
+    try:
+        done_in_period = int(db.execute(sql_done, params).fetchone()[0])
+        total_in_period = int(db.execute(sql_total, params).fetchone()[0])
+    except sqlite3.OperationalError:
+        done_in_period, total_in_period = 0, 0
+
+    return dict(counter), done_in_period, total_in_period
+
+
 def compute_period_tf(db: sqlite3.Connection, since: str, row_limit: int,
                       extra_stops: set[str] | None = None,
                       channel: str | None = None) -> dict[str, int]:
     """
-    Рахує TF за останніми повідомленнями періоду. Повертає Counter з ключами
-    "category::lemma" (per/loc/org/term).
-
-    Якщо передано channel — обмежує вибірку постами з конкретного каналу
-    (channel_title рівне переданому значенню).
+    Fallback (повільний): рахує TF за останніми повідомленнями періоду шляхом
+    запуску NER на льоту. Дедуплікує тексти за hash. Використовується якщо
+    кеш ще порожній або частково заповнений.
     """
     if channel:
         rows = db.execute(
@@ -363,10 +688,21 @@ def compute_period_tf(db: sqlite3.Connection, since: str, row_limit: int,
             "SELECT text FROM messages WHERE saved_at >= ? ORDER BY id DESC LIMIT ?",
             (since, row_limit)
         ).fetchall()
-    counter: Counter = Counter()
+
+    by_hash_dup: dict[str, int] = defaultdict(int)
+    by_hash_text: dict[str, str] = {}
     for (text,) in rows:
+        t = text or ""
+        h = hashlib.blake2b(t.encode("utf-8"), digest_size=16).hexdigest()
+        by_hash_dup[h] += 1
+        if h not in by_hash_text:
+            by_hash_text[h] = t
+
+    counter: Counter = Counter()
+    for h, dup in by_hash_dup.items():
+        text = by_hash_text[h]
         for key in tokenize_lemmas(text, extra_stops):
-            counter[key] += 1
+            counter[key] += dup
     return counter
 
 

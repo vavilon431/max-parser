@@ -3,6 +3,45 @@
 
 ---
 
+## [2026-05-07 09:50] — v3.9: Прискорення тематичної аналітики + морфологічний пошук
+
+**Ключові зміни:**
+
+NLP-пайплайн ([nlp.py](../nlp.py)):
+- Видалено `NewsSyntaxParser` з пайплайна — синтаксичні дані ніде не використовувались, але з'їдали ~30% часу обробки одного посту. Pipeline тепер `(segmenter, morph_vocab, morph_tagger, ner_tagger)`.
+- `is_topical()` через `lemma.startswith(roots_tuple)` — нативний C-цикл замість Python `any(...)`.
+- Нова `tokenize_aggregated(text)` повертає `{(category, lemma): count}` — зручний формат для запису в БД.
+
+Інкрементальний кеш лем ([nlp.py:228+](../nlp.py)):
+- Нові таблиці `message_lemmas` (msg_id, category, lemma, n) і `message_lemmas_done` (msg_id) — мітка обробки.
+- `process_messages_batch(db, batch_size, extra_stops, since, n_workers)` — обробляє наступну партію постів. Дедуплікує тексти за `blake2b(text)` перед NER (репости ловляться один раз).
+- Multi-core: `_process_with_pool` через `ProcessPoolExecutor` з `_worker_init`/`_worker_run`. Контролюється env `MAX_PARSER_NLP_WORKERS` (default 1).
+- `compute_period_tf_from_cache(db, since, channel, extra_stops)` — читає TF з агрегатного SQL (мс), стоп-слова фільтруються на льоту.
+- Старий `compute_period_tf` залишений як fallback, тепер з hash-дедуплікацією.
+- `purge_lemma_from_cache(db, lemma)` — видаляє лему з кеша при додаванні стоп-слова.
+
+Dashboard інтеграція ([dashboard.py](../dashboard.py)):
+- `_compute_top_words_blocking` тепер спершу читає кеш; падає у fallback тільки якщо покриття < `LEMMA_CACHE_MIN_COVERAGE` (80%).
+- Новий `lemma_cache_scheduler()` — фоновий потік, пріоритет 24h → решта → idle. Batch 200 постів, ~85-95 пост/сек на 1 ядрі.
+- `api_add_stop_word` чистить рядки з `message_lemmas` через `purge_lemma_from_cache`.
+- Реєстрація `init_lemma_cache_schema(db)` і `lemma_cache_scheduler()` у startup.
+
+Морфологічний пошук ([dashboard.py:1958-2018](../dashboard.py)):
+- `build_fts_query` тепер проганяє кожен токен через `SnowballStemmer("russian")` перед додаванням `*`. Запит "зеленский" перетворюється на `зеленск*` і ловить усі словоформи (зеленского, зеленскому, ...).
+- Раніше `зеленский*` знаходив 1 483 пости, тепер `зеленск*` — 2 531 (+71%). Для "ракета" виграш +811% (519 → 4731).
+- Edge-кейси: явна `*` від користувача → as-is, оператори AND/OR/лапки → as-is, токени <5 символів → без стемінгу (щоб не отримати "ид*" з "идти"), не-кирилиця → без стемінгу.
+
+Метрики на VPS після деплою:
+- Топ-слова за 24h: **0.9с** з кешу замість 10-20 хв (на 14k постах).
+- Кеш на 24h-вікні: 100% (14703/14705 постів) одразу після першого прогріву.
+- На повну БД (~250k постів) кеш доходить за ~45-50 хв background, не блокуючи UI.
+
+**Поточний стан:** На VPS працює нова версія, кеш активно наповнюється; тематична аналітика і пошук помітно швидші, словоформи ловляться повноцінно.
+
+**Наступний крок:** Опційно — підняти `MAX_PARSER_NLP_WORKERS` до 4 (потрібно підняти `MemoryMax` у systemd до ~2400МБ); додати UI-індикатор покриття кеша на дашборді ("Тематична аналітика: кеш 87%").
+
+---
+
 ## [2026-05-04 15:00] — v3.8: Session-based auth + заглушка Аналітики
 
 **Ключові зміни:**
