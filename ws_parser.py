@@ -30,6 +30,9 @@ DB_FILE           = Path(__file__).parent / "matches.db"
 CHANNELS_PER_WORKER  = 500   # каналів на одне WS з'єднання
 FALLBACK_INTERVAL    = 180   # секунд між fallback polling циклами
 RECONNECT_DELAY      = 20    # секунд перед reconnect
+CONNECT_TIMEOUT      = 30    # секунд на повний connect+handshake+login
+SUBSCRIBE_TIMEOUT    = 60    # секунд на цикл підписки на канали
+IDLE_TIMEOUT         = 600   # секунд без push → форс-реконнект (захист від мовчазних розривів)
 
 # ── Утиліти ───────────────────────────────────────────────────────────────────
 
@@ -145,6 +148,7 @@ class WSClient:
         self._pending: dict[int, asyncio.Future] = {}
         self._ws = None
         self._recv_task = None
+        self.last_activity = time.monotonic()
 
     def _ns(self) -> int:
         self._seq += 1
@@ -157,6 +161,7 @@ class WSClient:
     async def _recv_loop(self):
         try:
             async for raw in self._ws:
+                self.last_activity = time.monotonic()
                 try:
                     msg = json.loads(raw)
                 except Exception:
@@ -166,9 +171,18 @@ class WSClient:
                     await self._on_push(msg)
         except Exception as e:
             print(f"[{ts()}][W{self.worker_id}] _recv_loop exception: {e}", flush=True)
+            raise
 
     async def connect(self) -> bool:
-        self._ws = await websockets.connect(WS_URL, additional_headers=WS_HEADERS, ping_interval=30)
+        self._ws = await websockets.connect(
+            WS_URL,
+            additional_headers=WS_HEADERS,
+            ping_interval=30,
+            ping_timeout=20,
+            open_timeout=15,
+            close_timeout=10,
+        )
+        self.last_activity = time.monotonic()
         self._recv_task = asyncio.create_task(self._recv_loop())
 
         hs = await self._send_recv(6, handshake_payload(self.device_id))
@@ -203,14 +217,17 @@ class WSClient:
                 fut.set_result(msg)
 
     async def close(self):
-        if self._recv_task:
+        if self._recv_task and not self._recv_task.done():
             self._recv_task.cancel()
             try:
-                await self._recv_task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(self._recv_task, timeout=5)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
         if self._ws:
-            await self._ws.close()
+            try:
+                await asyncio.wait_for(self._ws.close(), timeout=5)
+            except Exception:
+                pass
 
 # ── Моніторинг ────────────────────────────────────────────────────────────────
 
@@ -246,6 +263,22 @@ async def worker(worker_id: int, token: str, device_id: str,
         log(f"[{title}] [{msg_time}] {text[:120]}")
         save_message(db, title, channel_link, subs, chat_id, msg_id, msg_time, post_link, text)
 
+    async def subscribe_all(c: WSClient):
+        for chat_id in chat_ids:
+            await c._ws.send(make_msg(
+                c._ns(), 75, {"chatId": chat_id, "subscribe": True}
+            ))
+            await asyncio.sleep(0.03)
+
+    async def idle_watchdog(c: WSClient):
+        """Якщо WS живий, але push'ів немає > IDLE_TIMEOUT — форс-реконнект."""
+        while True:
+            await asyncio.sleep(60)
+            idle = time.monotonic() - c.last_activity
+            if idle > IDLE_TIMEOUT:
+                log(f"Idle {idle:.0f}s без push'ів — форс-реконнект")
+                return
+
     while True:
         client = WSClient(token, device_id, wid)
 
@@ -264,27 +297,46 @@ async def worker(worker_id: int, token: str, device_id: str,
         client._on_push = on_push
 
         try:
-            if not await client.connect():
-                log("Не вдалось підключитись, retry...")
-                await asyncio.sleep(RECONNECT_DELAY)
-                continue
+            try:
+                connected = await asyncio.wait_for(client.connect(), timeout=CONNECT_TIMEOUT)
+            except asyncio.TimeoutError:
+                log(f"Connect таймаут (>{CONNECT_TIMEOUT}s)")
+                connected = False
 
-            log(f"Підписуємось на {len(chat_ids)} каналів...")
-            for chat_id in chat_ids:
-                await client._ws.send(make_msg(
-                    client._ns(), 75, {"chatId": chat_id, "subscribe": True}
-                ))
-                await asyncio.sleep(0.03)
+            if not connected:
+                log(f"Не вдалось підключитись. Reconnect через {RECONNECT_DELAY}s...")
+            else:
+                log(f"Підписуємось на {len(chat_ids)} каналів...")
+                subscribed = False
+                try:
+                    await asyncio.wait_for(subscribe_all(client), timeout=SUBSCRIBE_TIMEOUT)
+                    subscribed = True
+                except asyncio.TimeoutError:
+                    log(f"Subscribe таймаут (>{SUBSCRIBE_TIMEOUT}s)")
 
-            log(f"Підписка відправлена. Слухаємо push...")
+                if subscribed:
+                    log(f"Підписка відправлена. Слухаємо push...")
+                    client.last_activity = time.monotonic()
 
-            # Чекаємо поки recv_loop не завершиться (розрив з'єднання)
-            await client._recv_task
+                    # Чекаємо: або recv_loop падає (розрив), або idle_watchdog (мовчанка)
+                    wd_task = asyncio.create_task(idle_watchdog(client))
+                    try:
+                        done, _pending = await asyncio.wait(
+                            {client._recv_task, wd_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for t in done:
+                            exc = t.exception()
+                            if exc and not isinstance(exc, asyncio.CancelledError):
+                                raise exc
+                    finally:
+                        if not wd_task.done():
+                            wd_task.cancel()
 
         except (websockets.ConnectionClosed, OSError) as e:
             log(f"З'єднання розірвано: {e}. Reconnect через {RECONNECT_DELAY}s...")
         except Exception as e:
-            log(f"Помилка: {e}. Reconnect через {RECONNECT_DELAY}s...")
+            log(f"Помилка ({type(e).__name__}): {e}. Reconnect через {RECONNECT_DELAY}s...")
         finally:
             await client.close()
 
