@@ -148,7 +148,7 @@ _LOGIN_TEMPLATE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Вхід — MAX Parser</title>
+  <title>Вхід — MAX Radar</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     body {
@@ -206,7 +206,7 @@ _LOGIN_TEMPLATE = """<!doctype html>
 </head>
 <body>
   <form class="login-card" method="post" action="{{ url_for('login_page') }}" autocomplete="off">
-    <div class="login-title">MAX Parser</div>
+    <div class="login-title">MAX Radar</div>
     <div class="login-subtitle">Вхід у дашборд</div>
     {% if error %}<div class="login-error">{{ error }}</div>{% endif %}
     <input type="hidden" name="next" value="{{ next_url }}">
@@ -272,7 +272,7 @@ TEMPLATE = """
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MAX Parser</title>
+  <title>MAX Radar</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js" defer></script>
@@ -280,7 +280,7 @@ TEMPLATE = """
   <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js" defer></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; }
-    :root { --page-max: 1400px; --page-pad: 1.25rem; }
+    :root { --page-max: 1190px; --page-pad: 1.25rem; }
     body { background: #080b14; color: #c9d1d9; font-family: 'Inter', sans-serif; min-height: 100vh; }
 
     /* ── PDF-режим: інверсна тема для друку ───────────────────────────────── */
@@ -320,6 +320,11 @@ TEMPLATE = """
     body.pdf-mode .topics-title strong,
     body.pdf-mode .timeline-title strong,
     body.pdf-mode .channel-name { color: #000 !important; }
+    /* Стрічка постів у PDF не потрібна — звіт обмежується блоками до Тематичної аналітики включно. */
+    body.pdf-mode #main-grid { display: none !important; }
+    /* У PDF контейнери розтягуються на всю доступну ширину знімка html2canvas, щоб
+       результат заповнював аркуш A4 без широких білих полів зліва-справа. */
+    body.pdf-mode { --page-max: 100% !important; }
 
     /* Фон з градієнтом */
     body::before {
@@ -614,7 +619,7 @@ TEMPLATE = """
     /* Sidebar */
     .sidebar-card {
       background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.06);
-      border-radius: 14px; padding: 1.25rem; overflow-y: auto; max-height: 420px;
+      border-radius: 14px; padding: 1.25rem; overflow-y: auto; max-height: 560px;
     }
     .sidebar-title { font-size: 0.68rem; font-weight: 600; color: #3d4a5c; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 1rem; }
     .channel-row { margin-bottom: 0.85rem; }
@@ -694,7 +699,7 @@ TEMPLATE = """
   <div class="topbar-inner">
     <div class="brand">
       <div class="brand-dot"></div>
-      MAX Parser
+      MAX Radar
     </div>
     <div class="d-flex align-items-center gap-3">
       <span class="topbar-meta">{{ stats.total }} постів · {{ now }}</span>
@@ -772,9 +777,12 @@ TEMPLATE = """
     </select>
     <button type="submit" class="btn-search">Знайти</button>
     <button type="button" class="btn-search" id="export-xlsx-btn"
-            title="Завантажити поточну вибірку в .xlsx (актуальна кількість переглядів збирається з MAX на момент завантаження)">📥 Завантажити</button>
-    {# Тимчасова заглушка: кнопка завжди disabled до подальшого рішення #}
+            title="Завантажити поточну вибірку в .xlsx (актуальна кількість переглядів збирається з MAX на момент завантаження)"
+            aria-label="Завантажити в .xlsx">💾</button>
+    {# Тимчасово прихована: тримаємо в DOM (живий JS-обробник `analytics-btn`),
+       але візуально не показуємо до подальшого рішення. #}
     <button type="button" class="btn-search" id="analytics-btn" disabled
+            style="display:none"
             title="Тимчасово недоступно">🧠 Аналітика</button>
     <button type="button" class="btn-search" onclick="generatePDF(this)"
             title="Сформувати PDF-звіт того, що зараз на дашборді">📄 Звіт</button>
@@ -811,8 +819,10 @@ TEMPLATE = """
       <span id="timeline-reach-total" class="timeline-reach-total"></span>
     </div>
     <div class="timeline-tabs">
+      {# `active`-клас навмисно не виставлений у шаблоні: вибраний період
+         відновлюється з localStorage у DOMContentLoaded (default 7). #}
       <button type="button" class="timeline-tab" data-days="7">7 днів</button>
-      <button type="button" class="timeline-tab active" data-days="30">30 днів</button>
+      <button type="button" class="timeline-tab" data-days="30">30 днів</button>
       <button type="button" class="timeline-tab" data-days="90">90 днів</button>
     </div>
   </div>
@@ -1235,8 +1245,8 @@ async function loadReach(days) {
     return;
   }
 
-  if (resp.status === 429) {
-    setReachStatus('⏸ зайнято іншим запитом охоплення, спробуйте за 5с', 'error');
+  if (resp.status === 429 && resp.body.error === 'queue_full') {
+    setReachStatus('⏸ занадто багато активних запитів охоплення, спробуйте пізніше', 'error');
     return;
   }
   if (resp.body.error === 'q_required') {
@@ -1252,6 +1262,11 @@ async function loadReach(days) {
     applyReachData(resp.body.data, days);
     setReachStatus('Охоплення (з кешу): сума переглядів по днях', 'done');
     return;
+  }
+
+  // Якщо одразу стали в чергу — показуємо позицію.
+  if (resp.body.state === 'queued') {
+    setReachStatus('⏳ у черзі на підрахунок охоплення: май витримку…');
   }
 
   // Polling
@@ -1274,6 +1289,11 @@ async function loadReach(days) {
     if (st.state === 'error') {
       const msg = st.error || 'unknown';
       setReachStatus('Не вдалось зібрати охоплення: ' + msg, 'error');
+      return;
+    }
+    if (st.state === 'queued') {
+      setReachStatus('⏳ у черзі на підрахунок охоплення: май витримку…');
+      _reachPollTimer = setTimeout(poll, 2000);
       return;
     }
     const total = st.total || 0;
@@ -1548,19 +1568,32 @@ function closeAnalytics() {
 document.addEventListener('DOMContentLoaded', () => {
   const tabs = document.querySelectorAll('.timeline-tab');
   if (!tabs.length) return;
+
+  // Вибраний період зберігаємо у localStorage, щоб після Refresh або «Знайти»
+  // не стрибало на дефолт. Default — 7 днів.
+  const ALLOWED = [7, 30, 90];
+  const LS_KEY = 'mention_days';
+  let savedDays = parseInt(localStorage.getItem(LS_KEY), 10);
+  if (!ALLOWED.includes(savedDays)) savedDays = 7;
+  const setActive = (days) => {
+    tabs.forEach(b => b.classList.toggle('active',
+      parseInt(b.dataset.days, 10) === days));
+  };
+  setActive(savedDays);
+
   tabs.forEach(btn => {
     btn.addEventListener('click', () => {
       const days = parseInt(btn.dataset.days, 10);
-      tabs.forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
+      try { localStorage.setItem(LS_KEY, String(days)); } catch (e) {}
+      setActive(days);
       loadTimeline(days);
     });
   });
   // Chart.js підвантажується з defer — даємо йому з'явитися
   if (typeof Chart === 'undefined') {
-    window.addEventListener('load', () => loadTimeline(30));
+    window.addEventListener('load', () => loadTimeline(savedDays));
   } else {
-    loadTimeline(30);
+    loadTimeline(savedDays);
   }
 });
 
@@ -1702,7 +1735,8 @@ async function generatePDF(btn) {
   const header = document.createElement('div');
   header.id = 'pdf-report-header';
   header.style.cssText =
-    'background:#ffffff;color:#000;padding:1.5rem 2rem 1rem;margin-bottom:1rem;' +
+    'background:#ffffff;color:#000;padding:1.5rem 2rem 1rem;margin:0 auto 1rem;' +
+    'max-width:var(--page-max);' +
     'border-bottom:2px solid #6c63ff;text-align:center;' +
     'font-family:system-ui,sans-serif;';
   const subParts = [];
@@ -1738,6 +1772,12 @@ async function generatePDF(btn) {
     if (sr) sr.ticks.color = '#000';
     if (lg && lg.labels) lg.labels.color = '#000';
     timelineChart.update('none');
+    // Контейнер графіка щойно розширився через pdf-mode CSS — Chart.js про це
+    // не дізнається до наступного resize-обсервера, тому форсуємо перерахунок
+    // розмірів canvas і чекаємо два кадри щоб браузер відмалював усе у нову ширину.
+    timelineChart.resize();
+    await new Promise(r => requestAnimationFrame(r));
+    await new Promise(r => requestAnimationFrame(r));
   }
 
   try {
@@ -1757,29 +1797,36 @@ async function generatePDF(btn) {
       }
     });
 
-    const imgData = canvas.toDataURL('image/jpeg', 0.92);
     const { jsPDF } = window.jspdf;
     const pdf = new jsPDF({ orientation: 'p', unit: 'mm', format: 'a4' });
-    const pageW = pdf.internal.pageSize.getWidth();
-    const pageH = pdf.internal.pageSize.getHeight();
-    const margin = 5;
-    const availW = pageW - margin * 2;
-    const availH = pageH - margin * 2;
+    const pageW = pdf.internal.pageSize.getWidth();   // 210
+    const pageH = pdf.internal.pageSize.getHeight();  // 297
+    const margin = 15;                                 // стандартні відступи для друку (мм)
+    const drawW = pageW - margin * 2;                  // ширина блоку = ширина листа − поля
+    const availH = pageH - margin * 2;                 // макс. висота на одну сторінку
 
-    // Вписуємо все на одну сторінку: масштабуємо за тим виміром, що "вужчий"
-    const imgRatio = canvas.width / canvas.height;
-    const pageRatio = availW / availH;
-    let drawW, drawH;
-    if (imgRatio > pageRatio) {
-      drawW = availW;
-      drawH = availW / imgRatio;
-    } else {
-      drawH = availH;
-      drawW = availH * imgRatio;
+    // Розтягуємо знімок по ширині A4 (мінус поля). Якщо висота не вміщується —
+    // ріжемо канвас на горизонтальні смуги і кладемо їх на послідовні сторінки.
+    const pxPerMm = canvas.width / drawW;
+    const sliceHpx = Math.floor(availH * pxPerMm);
+
+    let sy = 0;
+    let pageIdx = 0;
+    while (sy < canvas.height) {
+      const h = Math.min(sliceHpx, canvas.height - sy);
+      const slice = document.createElement('canvas');
+      slice.width = canvas.width;
+      slice.height = h;
+      const sctx = slice.getContext('2d');
+      sctx.fillStyle = '#ffffff';
+      sctx.fillRect(0, 0, canvas.width, h);
+      sctx.drawImage(canvas, 0, sy, canvas.width, h, 0, 0, canvas.width, h);
+      const sliceData = slice.toDataURL('image/jpeg', 0.92);
+      if (pageIdx > 0) pdf.addPage();
+      pdf.addImage(sliceData, 'JPEG', margin, margin, drawW, h / pxPerMm);
+      sy += h;
+      pageIdx++;
     }
-    const offsetX = (pageW - drawW) / 2;
-    const offsetY = margin;
-    pdf.addImage(imgData, 'JPEG', offsetX, offsetY, drawW, drawH);
 
     const d = new Date();
     const pad = n => String(n).padStart(2,'0');
@@ -2205,10 +2252,13 @@ _REACH_SAMPLE_SIZE = 800         # цільовий розмір вибірки 
 _REACH_HARD_LIMIT = 8000         # стеля SELECT — навіть без помилки, просто обрізаємо
 _REACH_ALLOWED_DAYS = (7, 30)    # 90 — занадто
 _REACH_TASK_TTL = 1800           # таски прибираємо через 30 хв
+_REACH_MAX_QUEUE = 10            # стеля одночасних task-ів у черзі (anti-spam)
 
 _reach_cache: dict[tuple, tuple[float, list]] = {}
 _reach_tasks: dict[str, dict] = {}
 _reach_lock = threading.Lock()
+_reach_queue_cond = threading.Condition(_reach_lock)
+_reach_pending_ids: list[str] = []          # FIFO id-ів task-ів у стані "queued"
 _reach_running: dict[str, bool] = {"busy": False}
 
 
@@ -2920,6 +2970,52 @@ def api_timeline():
     return jsonify(data)
 
 
+def _reach_queue_position_locked(task_id: str) -> int | None:
+    """Кількість task-ів попереду у черзі (без поточного). 0 = наступний.
+    `None` якщо task не серед очікуючих. Викликати лише під _reach_lock."""
+    ahead = 1 if _reach_running["busy"] else 0
+    for tid in _reach_pending_ids:
+        if tid == task_id:
+            return ahead
+        ahead += 1
+    return None
+
+
+def reach_dispatcher():
+    """Фоновий serial-worker: бере наступний task з черги і виконує його.
+
+    Серіалізація потрібна бо MAX блокує паралельні WS-сесії з тим самим
+    LOGIN-токеном (див. CLAUDE.md). Раніше API повертало 429 на другий запит;
+    тепер усі запити стають у чергу і обслуговуються по черзі — без помилки.
+    """
+    def _loop():
+        while True:
+            with _reach_queue_cond:
+                while not _reach_pending_ids:
+                    _reach_queue_cond.wait()
+                task_id = _reach_pending_ids.pop(0)
+                task = _reach_tasks.get(task_id)
+                if task is None:
+                    continue
+                _reach_running["busy"] = True
+                task["state"] = "pending"
+            params = task["params"]
+            # _run_reach_task сам ставить busy=False у finally
+            try:
+                _run_reach_task(task_id, params["q"], params["channel"], params["days"])
+            except Exception as e:
+                # Захист на випадок неочікуваної помилки поза try/finally воркера —
+                # busy має бути скинутий, інакше черга залипне.
+                print(f"[reach] dispatcher exception: {e}", flush=True)
+                with _reach_lock:
+                    _reach_running["busy"] = False
+                    if task is not None:
+                        task["state"] = "error"
+                        task["error"] = f"dispatcher: {e}"
+                        task["ts_done"] = time.time()
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 @app.route("/api/timeline-reach", methods=["POST"])
 def api_timeline_reach_start():
     q       = (request.json or {}).get("q", "").strip() if request.is_json else request.form.get("q", "").strip()
@@ -2947,15 +3043,15 @@ def api_timeline_reach_start():
 
     _reach_gc()
 
-    # Глобальний семафор — лише один task одночасно
-    with _reach_lock:
-        if _reach_running["busy"]:
-            return jsonify({"error": "busy", "retry_after": 5}), 429
-        _reach_running["busy"] = True
+    with _reach_queue_cond:
+        # Anti-spam: не пускаємо більше N task-ів одночасно у черзі.
+        if len(_reach_pending_ids) >= _REACH_MAX_QUEUE:
+            return jsonify({"error": "queue_full",
+                            "queue_size": len(_reach_pending_ids)}), 429
 
         task_id = uuid.uuid4().hex[:12]
         _reach_tasks[task_id] = {
-            "state": "pending",
+            "state": "queued",
             "progress": 0,
             "total": 0,
             "data": None,
@@ -2963,18 +3059,22 @@ def api_timeline_reach_start():
             "ts_started": time.time(),
             "params": {"q": q, "channel": channel, "days": days},
         }
+        _reach_pending_ids.append(task_id)
+        position = _reach_queue_position_locked(task_id)
+        _reach_queue_cond.notify()
 
-    threading.Thread(
-        target=_run_reach_task, args=(task_id, q, channel, days), daemon=True
-    ).start()
-
-    return jsonify({"task_id": task_id, "state": "pending"})
+    return jsonify({
+        "task_id": task_id,
+        "state": "queued",
+        "queue_position": position,
+    })
 
 
 @app.route("/api/timeline-reach/<task_id>")
 def api_timeline_reach_status(task_id: str):
     with _reach_lock:
         task = _reach_tasks.get(task_id)
+        position = _reach_queue_position_locked(task_id) if task else None
     if not task:
         return jsonify({"error": "unknown_task"}), 404
     out = {
@@ -2982,6 +3082,8 @@ def api_timeline_reach_status(task_id: str):
         "progress": task.get("progress", 0),
         "total":    task.get("total", 0),
     }
+    if task["state"] == "queued":
+        out["queue_position"] = position if position is not None else 0
     if task["state"] == "done":
         out["data"] = task["data"]
         out["posts_total"] = task.get("posts_total", 0)
@@ -3380,4 +3482,5 @@ if __name__ == "__main__":
     baseline_scheduler()
     warm_top_words_cache()
     lemma_cache_scheduler()
+    reach_dispatcher()
     app.run(host="0.0.0.0", port=8080, debug=False, threaded=True)
