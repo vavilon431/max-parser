@@ -1,0 +1,24 @@
+[Unit]
+Description=MAX Parser (instance B) — second account WebSocket monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+# Multi-account env: окремий токен, окремий device_id, префікс воркерів "B".
+# Логи інстансу B матимуть вигляд `[B0]..[B7]`, інстансу A (за замовч.) — `[W0]..[W7]`.
+Environment=WS_PARSER_LABEL=B
+Environment=WS_PARSER_TOKEN_FILE=/root/.login_token_b
+Environment=WS_PARSER_DEVICE_FILE=/root/.device_id_b
+ExecStart=/usr/bin/python3 -u /root/ws_parser.py
+Restart=on-failure
+RestartSec=20
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=max-parser-b
+MemoryMax=600M
+
+[Install]
+WantedBy=multi-user.target

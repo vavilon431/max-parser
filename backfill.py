@@ -27,7 +27,7 @@ import websockets
 
 from ws_common import (
     WS_URL, WS_HEADERS, get_device_id, get_login_token,
-    handshake_payload, make_msg,
+    handshake_payload, make_msg, PROJECT_START_MS,
 )
 
 ROOT          = Path(__file__).parent
@@ -70,12 +70,16 @@ def open_db() -> sqlite3.Connection:
 def save_message(conn: sqlite3.Connection, title: str, channel_link: str,
                  subs: int, chat_id: int, msg_id: str, msg_time: str,
                  post_link: str, text: str) -> bool:
-    """True якщо рядок реально вставлено (не дубль)."""
+    """True якщо рядок реально вставлено (не дубль).
+
+    Backfill пише saved_at = msg_time (а не now), щоб догнані з минулого
+    пости показувались на графіку у день публікації, а не догону.
+    """
     cur = conn.execute(
         "INSERT OR IGNORE INTO messages "
         "(saved_at,channel_title,channel_link,channel_subs,chat_id,msg_id,msg_time,post_link,text) "
         "VALUES (?,?,?,?,?,?,?,?,?)",
-        (now_iso(), title, channel_link, subs, chat_id, msg_id, msg_time, post_link, text)
+        (msg_time, title, channel_link, subs, chat_id, msg_id, msg_time, post_link, text)
     )
     return cur.rowcount > 0
 
@@ -192,6 +196,8 @@ async def backfill_channel(client: Client, alias: str, info: dict,
                 oldest = t
             if t < since_ms:
                 continue
+            if t < PROJECT_START_MS:
+                continue  # до старту проекту — не наше
             text = m.get("text", "")
             if not text:
                 continue
@@ -207,6 +213,8 @@ async def backfill_channel(client: Client, alias: str, info: dict,
 
         if oldest is None or oldest <= since_ms:
             break
+        if oldest <= PROJECT_START_MS:
+            break  # дійшли до старту проекту — стоп
         if oldest >= cursor_ms:
             break  # пагінація не рухається — стоп
         cursor_ms = oldest

@@ -9,6 +9,7 @@ MAX WS Parser — збір всіх нових постів з 2000+ публі�
 
 import asyncio
 import json
+import os
 import sqlite3
 import time
 import sys
@@ -19,7 +20,7 @@ import websockets
 
 from ws_common import (
     WS_URL, WS_HEADERS, get_device_id, get_login_token,
-    handshake_payload, make_msg,
+    handshake_payload, make_msg, PROJECT_START_MS,
 )
 
 # ── Конфіг ────────────────────────────────────────────────────────────────────
@@ -140,10 +141,11 @@ async def commit_watchdog(conn: sqlite3.Connection):
 # ── WS базовий клієнт ─────────────────────────────────────────────────────────
 
 class WSClient:
-    def __init__(self, token: str, device_id: str, worker_id: str = ""):
+    def __init__(self, token: str, device_id: str, worker_id: str = "", label: str = "W"):
         self.token = token
         self.device_id = device_id
         self.worker_id = worker_id
+        self.label = label  # "W" дефолт, "A"/"B" для multi-instance
         self._seq = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._ws = None
@@ -154,8 +156,12 @@ class WSClient:
         self._seq += 1
         return self._seq
 
+    @property
+    def tag(self) -> str:
+        return f"{self.label}{self.worker_id}" if self.worker_id else ""
+
     def log(self, msg: str):
-        prefix = f"[W{self.worker_id}]" if self.worker_id else ""
+        prefix = f"[{self.tag}]" if self.tag else ""
         print(f"[{ts()}]{prefix} {msg}", flush=True)
 
     async def _recv_loop(self):
@@ -170,7 +176,7 @@ class WSClient:
                 if msg.get("cmd") == 0 and hasattr(self, "_on_push"):
                     await self._on_push(msg)
         except Exception as e:
-            print(f"[{ts()}][W{self.worker_id}] _recv_loop exception: {e}", flush=True)
+            print(f"[{ts()}][{self.tag}] _recv_loop exception: {e}", flush=True)
             raise
 
     async def connect(self) -> bool:
@@ -233,8 +239,12 @@ class WSClient:
 
 async def worker(worker_id: int, token: str, device_id: str,
                  channel_map: dict[str, dict], all_channels: dict[str, dict],
-                 db: sqlite3.Connection):
-    """Один WS воркер: підписується на канали і обробляє push-події."""
+                 db: sqlite3.Connection, label: str = "W"):
+    """Один WS воркер: підписується на канали і обробляє push-події.
+
+    label: префікс інстансу — "W" дефолт, "A"/"B" для multi-account.
+    Логи отримають вигляд `[A0]..[A7]` чи `[B0]..[B7]`.
+    """
 
     # chatId → метадані для ВСІХ каналів (push приходить усім воркерам одночасно)
     id_to_meta: dict[int, dict] = {
@@ -246,18 +256,21 @@ async def worker(worker_id: int, token: str, device_id: str,
     wid = str(worker_id)
 
     def log(msg):
-        print(f"[{ts()}][W{wid}] {msg}", flush=True)
+        print(f"[{ts()}][{label}{wid}] {msg}", flush=True)
 
     def handle_message(chat_id: int, m: dict):
         text = m.get("text", "")
         if not text:
             return
+        t = m.get("time", 0) or 0
+        if t < PROJECT_START_MS:
+            return  # репост/пересилання посту до старту проекту — ігноруємо
         meta = id_to_meta.get(chat_id, {})
         alias = meta.get("alias", str(chat_id))
         title = meta.get("title", alias)
         subs  = meta.get("subs", 0)
         msg_id    = str(m.get("id", ""))
-        msg_time  = datetime.fromtimestamp(m.get("time", 0) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+        msg_time  = datetime.fromtimestamp(t / 1000).strftime("%Y-%m-%d %H:%M:%S")
         channel_link = f"https://max.ru/{alias}"
         post_link    = f"https://max.ru/{alias}/{msg_id}"
         log(f"[{title}] [{msg_time}] {text[:120]}")
@@ -280,7 +293,7 @@ async def worker(worker_id: int, token: str, device_id: str,
                 return
 
     while True:
-        client = WSClient(token, device_id, wid)
+        client = WSClient(token, device_id, wid, label=label)
 
         async def on_push(msg: dict):
             op = msg.get("opcode")
@@ -345,8 +358,14 @@ async def worker(worker_id: int, token: str, device_id: str,
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
-    token = get_login_token()
-    device_id = get_device_id()
+    # Multi-account env vars: дефолтні значення = поведінка 1-го (єдиного) інстансу.
+    # Для 2-го інстансу systemd-юніт задає WS_PARSER_LABEL=B + кастомні файли токена/device_id.
+    label = os.environ.get("WS_PARSER_LABEL", "W")
+    token_file = os.environ.get("WS_PARSER_TOKEN_FILE") or None
+    device_file = os.environ.get("WS_PARSER_DEVICE_FILE") or None
+
+    token = get_login_token(file_path=token_file)
+    device_id = get_device_id(file_path=device_file)
     resolved = load_resolved()
 
     if not resolved:
@@ -360,12 +379,13 @@ async def main():
         dict(items[i:i + CHANNELS_PER_WORKER])
         for i in range(0, len(items), CHANNELS_PER_WORKER)
     ]
+    print(f"[{ts()}] Instance label: {label}", flush=True)
     print(f"[{ts()}] Каналів: {len(resolved)} | Воркерів: {len(groups)} (по ~{CHANNELS_PER_WORKER})", flush=True)
     print(f"[{ts()}] База даних: {DB_FILE}", flush=True)
     print(f"[{ts()}] Моніторинг запущено. Ctrl+C для зупинки.\n", flush=True)
 
     tasks = [
-        asyncio.create_task(worker(i, token, device_id, group, resolved, db))
+        asyncio.create_task(worker(i, token, device_id, group, resolved, db, label=label))
         for i, group in enumerate(groups)
     ]
     tasks.append(asyncio.create_task(commit_watchdog(db)))

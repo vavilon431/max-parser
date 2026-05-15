@@ -1,6 +1,8 @@
 # Секрети — НІКОЛИ не комітити
 .login_token
+.login_token_b
 .device_id
+.device_id_b
 .env
 .dashboard_secret
 .dashboard_auth
@@ -41,6 +43,10 @@ Thumbs.db
 scout_results.json
 scout_views_dump.json
 playwright_results.json
+
+# QR-скріни з pw_qr_capture — тимчасові, не для репо
+qr_*.png
+qr_screen*.png
 
 # Тестові експорти xlsx (приклад_формату.xlsx — лишаємо як reference)
 example/export_test.xlsx

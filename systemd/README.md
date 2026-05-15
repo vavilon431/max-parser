@@ -72,3 +72,19 @@ systemctl is-enabled max-dashboard   # повинно показати "enabled"
 - `max-dashboard` — 800 MB (бо Natasha моделі)
 
 Якщо процес перевищить ліміт, systemd його **вб'є** і перезапустить (OOM-kill через cgroups, без зачеплення всього VPS). Якщо постійні падіння — підняти ліміт у файлі і `systemctl daemon-reload && systemctl restart`.
+
+## Щоденний рестарт dashboard о 03:00 MSK
+
+`lemma-cache` у `dashboard.py` накопичує всі оброблені пости (за добу ~250k) і впирається у `MemoryMax=800M`. Тоді нові reach-задачі не можуть стартувати. Запобіжник — нічний рестарт через systemd timer.
+
+```bash
+# Інсталяція (один раз)
+scp systemd/max-dashboard-restart.{service,timer} root@85.192.56.53:/etc/systemd/system/
+ssh root@85.192.56.53 "systemctl daemon-reload && systemctl enable --now max-dashboard-restart.timer"
+
+# Перевірка розкладу
+systemctl list-timers max-dashboard-restart.timer
+
+# Ручний запуск (як перевірка)
+systemctl start max-dashboard-restart.service
+```

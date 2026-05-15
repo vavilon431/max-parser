@@ -1,0 +1,15 @@
+[Unit]
+Description=Trigger backfill-priority every 30 min
+# MAX дропає 50-70% push-постів у високочастотних каналах. Live push один не дає
+# 100% покриття — потрібен регулярний догон через op=49 для топ-100 main-flow.
+
+[Timer]
+# Кожна 0 і 30 хвилина години — стабільний предсказуваний 30-хв cycle.
+# OnUnitActiveSec не використовуємо: він потребує попередньої "активації через
+# таймер" як точки відліку, а ручні systemctl start її не задають.
+OnCalendar=*:0/30
+Persistent=true
+Unit=backfill-priority.service
+
+[Install]
+WantedBy=timers.target

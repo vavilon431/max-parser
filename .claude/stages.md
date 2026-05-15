@@ -3,6 +3,54 @@
 
 ---
 
+## [2026-05-15 09:30] — Multi-account multi-token + бейджі дельти на дашборді
+
+**Контекст:** після виявлення (08.05) масштабних пропусків live-парсера (50-70% для високочастотних каналів через MAX push-drop) додано регулярний backfill (`backfill_priority.py`) і нічний рестарт `max-dashboard` для очищення lemma-cache. Бейджі дельти каналів/постів на дашборді. 14.05 додано 2-й акаунт MAX (multi-token) для незалежної push-черги, але виявилось, що MAX дропає сесії при 16+ паралельних від одного IP — backfill зламався (errors=164). Розділили ролі: A — live, B — live + backfill. Deep backfill через 2-й токен догнав 24h-прогалини.
+
+**Ключові зміни:**
+
+Multi-account ([ws_common.py](../ws_common.py), [ws_parser.py](../ws_parser.py)):
+- `get_login_token(file_path=...)` і `get_device_id(file_path=...)` — параметризовані під другий акаунт. Backward-compatible: дефолтні аргументи зберігають поведінку.
+- `ws_parser.main()` читає env vars: `WS_PARSER_LABEL` (дефолт "W"), `WS_PARSER_TOKEN_FILE`, `WS_PARSER_DEVICE_FILE`. Воркер-префікс залежить від label: `[W0..W7]` або `[B0..B7]`.
+- `WSClient` приймає `label` параметр і має `.tag` (наприклад "B3") для логів.
+
+Backfill через 2-й токен ([backfill_priority.py](../backfill_priority.py), [systemd/backfill-priority.service](../systemd/backfill-priority.service)):
+- `Client.__init__` читає `BACKFILL_TOKEN_FILE` / `BACKFILL_DEVICE_FILE` з env vars (за замовч. — A-токен). У systemd unit задано `.login_token_b` + `.device_id_b` — так backfill не конкурує з A-парсером за per-IP-quota MAX.
+- `SYNC_WINDOW` — з env var `BACKFILL_SYNC_WINDOW` (дефолт 30). Для одноразового deep-backfill можна підняти до 500.
+- `backfill-priority.timer` переписаний на `OnCalendar=*:0/30` (раніше `OnUnitActiveSec` не запускав таймер бо потребує "активацію через timer" як точки відліку, а ручні `systemctl start` її не задають).
+
+Друга інстанція парсера ([systemd/max-parser-b.service](../systemd/max-parser-b.service)):
+- Нова oneshot-сесія з `WS_PARSER_LABEL=B`, окремими файлами токена/device_id, `MemoryMax=600M`.
+
+Бейджі дельти на дашборді ([dashboard.py:2225](../dashboard.py)):
+- `get_stats()` повертає додаткові метрики: `last_hour_prev`, `last_day_prev` (постів за попередній період) і `active_channels_24h`, `active_channels_24h_prev` (унікальних авторів за 24h).
+- У картці "Каналів" — бейдж `XXX активних за 24h ↑+N`/`↓-N` (порівняння каналів-донорів).
+- У картках "За годину" і "За 24 год" — стрілка з різницею **постів** проти попереднього аналогічного періоду (зелена ↑ ріст, червона ↓ спад, нейтральна `·` рівність).
+- CSS-стилі `.stat-delta`, `.delta-up`, `.delta-down`, `.delta-zero`.
+
+Нічний рестарт дашборда ([systemd/max-dashboard-restart.timer](../systemd/max-dashboard-restart.timer)):
+- `lemma-cache` накопичує ~250k+ постів за добу і впирається в `MemoryMax=800M` — нові reach-задачі не запускаються. Timer щодоби о 03:00 MSK перезапускає сервіс. Бекап-стратегія до повного LRU.
+
+QR-флоу для 2-го токена:
+- На VPS лежить `pw_qr_capture.py` (playwright з headless-Chromium), оновлено в новий `pw_qr_b.py` що ловить opcode=291 (а не лише 115) і авто-рефрешить screenshot кожні 25с. Користувач сканує телефоном, скрипт зберігає токен у `/root/.login_token_b`.
+
+Безпека ([.gitignore](../.gitignore)):
+- Додано `.login_token_b`, `.device_id_b` у список секретів.
+- `qr_*.png`, `qr_screen*.png` — тимчасові screenshots, не комітимо.
+
+**Поточний стан:**
+- Покриття main-flow топ-10: **99.1% за 24h, 92.5% за останню годину** (до multi-token + deep backfill було ~84%).
+- 3 сервіси active: `max-parser` (токен A, 8 WS), `max-parser-b` (токен B, 8 WS), `backfill-priority.timer` (op=49 через B-токен, 30-хв cycle).
+- Backfill виконується без помилок (errors=0).
+- Deep backfill (одноразовий, `SYNC_WINDOW=500`) додав +11,744 постів за 4.6 хв.
+
+**Наступний крок:**
+- Тиждень нагляду — чи 99% покриття тримається стабільно.
+- Якщо ні: додати 2-й IP на VPS (купити IPv4 у aeza ~$2/міс, або безкоштовний IPv6 якщо MAX підтримує) — другий парсер ходить через інший IP, MAX бачить як 2 різні клієнти. Це обійде per-IP throttle повністю.
+- Опціонально: LRU-обмеження для lemma-cache у dashboard.py (заміна щонічного рестарту на постійне рішення).
+
+---
+
 ## [2026-05-07 20:30] — Анти-зависання WS-воркерів + backfill пропущених постів
 
 **Контекст:** дашборд показав різке падіння — з ~28k постів/день (05.05) до 3.7k за неповний день 07.05. Парсер працював 3 доби без рестарту, статус `active`, але приймав push'і у 5/8 воркерів — W0 замовчав о 13:05, W7 о 16:19, W3 о 16:25. Жодного exception'а перед смертю — просто тиша. ~1500 каналів (37% покриття) залишились без підписки.

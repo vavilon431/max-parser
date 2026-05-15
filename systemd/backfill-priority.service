@@ -1,0 +1,22 @@
+[Unit]
+Description=Backfill priority main-flow channels via op=49 (catch-up missed posts)
+After=max-parser.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root
+# Backfill ходить через 2-й акаунт MAX — щоб не конкурувати з live-парсером A
+# за per-IP-quota op=49 (MAX дропає "сторонні" сесії якщо одночасно багато від
+# одного IP, що ламало backfill коли B-парсер ще був на спільному токені).
+Environment=BACKFILL_TOKEN_FILE=/root/.login_token_b
+Environment=BACKFILL_DEVICE_FILE=/root/.device_id_b
+ExecStart=/usr/bin/python3 -u /root/backfill_priority.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=backfill-priority
+# Жорстке обмеження: не довше за 25 хв (timer тригерить кожні 30 хв)
+TimeoutStartSec=1500
+# Memory cap нижчий за парсер — тут лише WS + один conn до SQLite
+MemoryMax=300M

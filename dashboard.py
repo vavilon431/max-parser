@@ -365,6 +365,11 @@ TEMPLATE = """
     .stat-icon { font-size: 1.4rem; margin-bottom: 0.5rem; }
     .stat-number { font-size: 1.9rem; font-weight: 700; color: #fff; line-height: 1; }
     .stat-label { font-size: 0.72rem; color: #4a5568; text-transform: uppercase; letter-spacing: 1.2px; margin-top: 4px; }
+    .stat-delta { font-size: 0.78rem; color: #6b7280; margin-top: 6px; }
+    .stat-delta .ch-count { color: #a0aec0; }
+    .stat-delta .delta-up   { color: #4caf50; font-weight: 600; margin-left: 6px; }
+    .stat-delta .delta-down { color: #e08080; font-weight: 600; margin-left: 6px; }
+    .stat-delta .delta-zero { color: #6b7280; margin-left: 6px; }
 
     /* Tops row (Топ каналів). Один список — повна ширина, два — 50/50 на широких. */
     .tops-grid {
@@ -722,16 +727,35 @@ TEMPLATE = """
     <div class="stat-icon">📡</div>
     <div class="stat-number">{{ stats.channels }}</div>
     <div class="stat-label">Каналів</div>
+    <div class="stat-delta">
+      <span class="ch-count">{{ stats.active_channels_24h }} активних за 24h</span>
+      {% set dch = stats.active_channels_24h - stats.active_channels_24h_prev %}
+      {% if dch > 0 %}<span class="delta-up">↑+{{ dch }}</span>
+      {% elif dch < 0 %}<span class="delta-down">↓{{ dch }}</span>
+      {% else %}<span class="delta-zero">·</span>{% endif %}
+    </div>
   </div>
   <div class="stat-card">
     <div class="stat-icon">⚡</div>
     <div class="stat-number">{{ stats.last_hour }}</div>
     <div class="stat-label">За годину</div>
+    <div class="stat-delta">
+      {% set dh = stats.last_hour - stats.last_hour_prev %}
+      {% if dh > 0 %}<span class="delta-up">↑+{{ dh }}</span>
+      {% elif dh < 0 %}<span class="delta-down">↓{{ dh }}</span>
+      {% else %}<span class="delta-zero">·</span>{% endif %}
+    </div>
   </div>
   <div class="stat-card">
     <div class="stat-icon">📅</div>
     <div class="stat-number">{{ stats.last_day }}</div>
     <div class="stat-label">За 24 год</div>
+    <div class="stat-delta">
+      {% set dd = stats.last_day - stats.last_day_prev %}
+      {% if dd > 0 %}<span class="delta-up">↑+{{ dd }}</span>
+      {% elif dd < 0 %}<span class="delta-down">↓{{ dd }}</span>
+      {% else %}<span class="delta-zero">·</span>{% endif %}
+    </div>
   </div>
 </div>
 
@@ -2221,13 +2245,31 @@ def get_stats(db) -> dict:
     with _stats_lock:
         if _stats_cache and time.time() - _stats_cache[0] < _STATS_CACHE_TTL:
             return _stats_cache[1]
-    hour_ago = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
-    day_ago  = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now()
+    hour_ago      = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    two_hours_ago = (now - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+    day_ago       = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    two_days_ago  = (now - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
     stats = {
         "total":     db.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
         "channels":  db.execute("SELECT COUNT(DISTINCT channel_link) FROM messages").fetchone()[0],
         "last_hour": db.execute("SELECT COUNT(*) FROM messages WHERE saved_at >= ?", (hour_ago,)).fetchone()[0],
         "last_day":  db.execute("SELECT COUNT(*) FROM messages WHERE saved_at >= ?", (day_ago,)).fetchone()[0],
+        # Постові дельти проти попереднього аналогічного періоду — для стрілок
+        # у картках "За годину" / "За 24 год".
+        "last_hour_prev": db.execute(
+            "SELECT COUNT(*) FROM messages WHERE saved_at >= ? AND saved_at < ?",
+            (two_hours_ago, hour_ago)).fetchone()[0],
+        "last_day_prev":  db.execute(
+            "SELECT COUNT(*) FROM messages WHERE saved_at >= ? AND saved_at < ?",
+            (two_days_ago, day_ago)).fetchone()[0],
+        # Активні унікальні канали за 24h + попередня доба — для бейджа в "Каналів".
+        "active_channels_24h":      db.execute(
+            "SELECT COUNT(DISTINCT channel_link) FROM messages WHERE saved_at >= ?",
+            (day_ago,)).fetchone()[0],
+        "active_channels_24h_prev": db.execute(
+            "SELECT COUNT(DISTINCT channel_link) FROM messages WHERE saved_at >= ? AND saved_at < ?",
+            (two_days_ago, day_ago)).fetchone()[0],
     }
     with _stats_lock:
         _stats_cache = (time.time(), stats)

@@ -1,0 +1,13 @@
+[Unit]
+Description=Trigger max-dashboard restart daily at 03:00 MSK
+# Без cron-цього таймера lemma-cache у dashboard.py за ~24h набирає 250k+ постів
+# і впирається у MemoryMax=800M, після чого нові reach-задачі не запускаються
+# (vide CLAUDE.md "Функція Охоплення").
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+Unit=max-dashboard-restart.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=Daily restart of max-dashboard to free accumulated lemma-cache memory
+After=max-dashboard.service
+Requisite=max-dashboard.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart max-dashboard.service
