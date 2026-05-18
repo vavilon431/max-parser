@@ -1597,13 +1597,9 @@ async function startAnalytics() {
 
 function showAnalyticsPending(q, meta) {
   document.getElementById('analytics-q').textContent = `«${q}»`;
-  const used = meta.posts_used ?? '?';
-  const total = meta.posts_total ?? '?';
-  document.getElementById('analytics-meta').textContent =
-    `Pack відправлено в чергу · ${used}/${total} постів`;
+  document.getElementById('analytics-meta').textContent = '';
   document.getElementById('analytics-body').innerHTML =
-    `<p>GitHub Action автоматично запустив cloud routine. Результат з'явиться тут через ~1-2 хвилини.</p>` +
-    `<p>Якщо нічого не сталось протягом 5 хвилин — відкрий <a href="${meta.routine_url}" target="_blank" rel="noopener">сторінку routine</a> для діагностики (там видно статус, помилки і кнопку Run now як fallback).</p>`;
+    `<p>Запит обробляється. Результат з'явиться тут через ~1-2 хвилини. Май витримку.</p>`;
   document.getElementById('analytics-result').style.display = 'block';
   const grid = document.getElementById('main-grid');
   if (grid) grid.style.display = 'none';
