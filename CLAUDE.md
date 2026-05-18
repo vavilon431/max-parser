@@ -105,8 +105,11 @@ NER+syntax-пайплайн ~30-60 мс/пост. На 3000 постів (`MAX_R
 **Hash** детермінований від `(q, channel, since_ts, until_ts)` — повторний клік із тими самими фільтрами одразу віддає кешований результат із репо.
 
 **Тригер routine:**
-- **Cron 1 раз/година** — safety net. Якщо у pending є файли, але користувач не запустив manually, обробка станеться в межах години.
-- **Manual через UI** — JS показує посилання на `https://claude.ai/code/routines/<id>` у pending-screen; натиснення відкриває сторінку routine, де можна "Run now" для миттєвої обробки.
+- **GitHub Action `.github/workflows/fire-routine.yml`** — основний шлях. Спрацьовує на push до `analytics/pending/**`, викликає `POST /v1/claude_code/routines/<id>/fire` через `secrets.ROUTINE_FIRE_TOKEN`. Action в Microsoft infra, тому НЕ геоблокований (на відміну від VPS у KZ — `api.anthropic.com` оттуди 403).
+- **Cron `7 * * * *` UTC** — safety net якщо Action провалився.
+- **Manual через UI** — JS показує посилання на `https://claude.ai/code/routines/<id>` у pending-screen для fallback (Run now на тій сторінці).
+
+**Авторизація для push із routine:** Anthropic GitHub integration (Connectors → GitHub Integration на claude.ai) має тільки **read** доступ — push з routine 403. Тому в `prompt` routine вшито fine-grained PAT (`Contents: Read+Write` на `vavilon431/max-parser`), яким routine робить `git remote set-url origin "https://x-access-token:PAT@github.com/..."` перед push. Token зберігається в Anthropic logах routine — обмежений scope мінімізує ризик.
 
 **Дані обміну:** `/root/max-parser-repo/` — окремий git-клон (через SSH deploy key). Не плутати з runtime-каталогом `/root/` (там `dashboard.py`, `matches.db`). Дашборд читає з / пише в `analytics/pending/` і `analytics/results/` через `subprocess` + `git`.
 
