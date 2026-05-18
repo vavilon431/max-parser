@@ -1,0 +1,37 @@
+name: Fire routine on new pending pack
+
+# Дашборд commit'ить нові pack у analytics/pending/. Action триггерить cloud
+# routine, бо дашборд із VPS у KZ геоблокований Anthropic API. GitHub runners
+# не у RU/KZ — для них fire-endpoint доступний.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'analytics/pending/**'
+
+jobs:
+  fire:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Count pending pack files
+        id: check
+        run: |
+          count=$(find analytics/pending -name '*.md' -not -name '.gitkeep' 2>/dev/null | wc -l)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Pending pack files: $count"
+
+      - name: Trigger Claude Code routine
+        if: steps.check.outputs.count != '0'
+        env:
+          ROUTINE_FIRE_TOKEN: ${{ secrets.ROUTINE_FIRE_TOKEN }}
+        run: |
+          curl -fsS -X POST \
+            "https://api.anthropic.com/v1/claude_code/routines/trig_01BuHdcdyvecVXpjMnbmDesM/fire" \
+            -H "Authorization: Bearer $ROUTINE_FIRE_TOKEN" \
+            -H "anthropic-beta: experimental-cc-routine-2026-04-01" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "Content-Type: application/json" \
+            -d '{"text":"pending pack pushed via dashboard"}'
