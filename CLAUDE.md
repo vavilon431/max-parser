@@ -79,6 +79,7 @@ NER+syntax-пайплайн ~30-60 мс/пост. На 3000 постів (`MAX_R
 ## Деплой і експлуатація
 
 - **VPS:** alias `max-vps` (host `85.192.56.53`, user `root`). Уся ціль — `/root/` (плоско, не в підпапці): `ws_parser.py`, `dashboard.py`, `nlp.py`, `topical_roots.txt`, `matches.db`. Конфіг systemd — у `systemd/`, інструкція там же ([systemd/README.md](systemd/README.md)).
+- **Канал AI-аналітики:** окремий git-клон репо у `/root/max-parser-repo/` (через SSH deploy key `~/.ssh/github_deploy`). Дашборд commit'ить pending pack-файли, cloud routine на claude.ai обробляє і пише результати. Деталі — в секції "AI-аналітика через cloud routine" нижче.
 - **Workflow:** код-перший. Усі правки — локально → `scp` на VPS → `systemctl restart`. Жодних ad-hoc правок безпосередньо на сервері.
 - **Сервіси:** `max-parser.service` (memory cap 600 МБ), `max-dashboard.service` (cap 800 МБ — Natasha моделі). Логи — systemd journal (`journalctl -u max-dashboard -n 50`).
 - **Деплой dashboard:** після `scp` обов'язково `systemctl restart max-dashboard`. Перший запит після рестарту — кеш холодний, ~30-60 с на baseline + перший період.
@@ -89,6 +90,29 @@ NER+syntax-пайплайн ~30-60 мс/пост. На 3000 постів (`MAX_R
 Дашборд показує суму переглядів по днях (`/api/timeline-reach`). Архітектура — асинхронна: POST стартує фоновий task, GET по `task_id` опитує прогрес.
 
 **Критичне обмеження:** глобальний семафор `_reach_running["busy"]` — одночасно виконується лише один reach-task, бо `views_fetcher` відкриває окрему MAX WS-сесію з тим самим токеном, і паралельні сесії ламають авторизацію. Якщо `busy=True` зависло довше ~5 хв (WS обрив без `finally`) — `systemctl restart max-dashboard`.
+
+## AI-аналітика через cloud routine
+
+Кнопка "🧠 Аналітика" на дашборді — pipeline через GitHub + cloud routine на claude.ai. Дашборд **сам не викликає** Claude API; натомість commit'ить pack у репо, cloud routine його обробляє.
+
+**Flow:**
+1. Користувач натискає кнопку → JS POST'ить `/api/analytics/start` (`q` + `period=24h|7d`).
+2. Дашборд формує `<hash>.md` (метадані + system prompt із [summary.txt](summary.txt) + дамп постів), кладе у `/root/max-parser-repo/analytics/pending/`, `git commit + push origin main`.
+3. JS polling `/api/analytics/result/<hash>` кожні 10с (timeout 65 хв).
+4. Cloud routine `trig_01BuHdcdyvecVXpjMnbmDesM` (claude.ai, cron `7 * * * *` UTC) клонує репо, обробляє pending, commit'ить `results/<hash>.md`, push, видаляє pending.
+5. Дашборд `git pull` під час polling → бачить result → рендерить через `_md_to_html`.
+
+**Hash** детермінований від `(q, channel, since_ts, until_ts)` — повторний клік із тими самими фільтрами одразу віддає кешований результат із репо.
+
+**Тригер routine:**
+- **Cron 1 раз/година** — safety net. Якщо у pending є файли, але користувач не запустив manually, обробка станеться в межах години.
+- **Manual через UI** — JS показує посилання на `https://claude.ai/code/routines/<id>` у pending-screen; натиснення відкриває сторінку routine, де можна "Run now" для миттєвої обробки.
+
+**Дані обміну:** `/root/max-parser-repo/` — окремий git-клон (через SSH deploy key). Не плутати з runtime-каталогом `/root/` (там `dashboard.py`, `matches.db`). Дашборд читає з / пише в `analytics/pending/` і `analytics/results/` через `subprocess` + `git`.
+
+**Що НЕ потрібне:** `.anthropic_key`, `.anthropic_gateway`, `.anthropic_gateway_token`, пакет `anthropic`. Видалено разом зі старим API-flow. Якщо файли ще є локально — можна видалити, не використовуються.
+
+**Ліміти:** 600k символів пакету (~150k токенів), пости > 1500 символів обрізаються. Періоди — тільки `24h` або `7d`.
 
 ## resolve_channels.py — нюанси
 

@@ -12,6 +12,8 @@ import random
 import time
 import threading
 import io
+import hashlib
+import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -53,19 +55,17 @@ try:
 except ValueError:
     LEMMA_CACHE_WORKERS = 1
 
-# AI-аналітика через Claude API
-ANTHROPIC_KEY_FILE        = Path(__file__).parent / ".anthropic_key"
-# Опційний base_url для проксі (Cloudflare AI Gateway / LiteLLM) — потрібен через
-# гео-блок Anthropic у RU. Формат: https://gateway.ai.cloudflare.com/v1/<acct>/<gw>/anthropic
-ANTHROPIC_GATEWAY_FILE    = Path(__file__).parent / ".anthropic_gateway"
-# Опційний токен для Authenticated Gateway (cf-aig-authorization)
-ANTHROPIC_GATEWAY_TOKEN_FILE = Path(__file__).parent / ".anthropic_gateway_token"
-ANTHROPIC_MODEL           = "claude-sonnet-4-6"
+# AI-аналітика через cloud routine на claude.ai
+# Дашборд commit'ить pack у GitHub репо, cloud routine клонує-аналізує-комітить
+# результат у тому ж репо, дашборд git pull читає результат при polling.
+ANALYTICS_REPO_DIR        = Path("/root/max-parser-repo")
+ANALYTICS_PENDING_DIR     = ANALYTICS_REPO_DIR / "analytics" / "pending"
+ANALYTICS_RESULTS_DIR     = ANALYTICS_REPO_DIR / "analytics" / "results"
+ANALYTICS_ROUTINE_ID      = "trig_01BuHdcdyvecVXpjMnbmDesM"
+ANALYTICS_ROUTINE_URL     = f"https://claude.ai/code/routines/{ANALYTICS_ROUTINE_ID}"
 SUMMARY_PROMPT_FILE       = Path(__file__).parent / "summary.txt"
 ANALYTICS_MAX_INPUT_CHARS = 600_000   # ~150k токенів — безпечний поріг для context 200k
 ANALYTICS_POST_TRIM_CHARS = 1_500     # обрізання дуже довгих постів
-ANALYTICS_TASK_TTL        = 1800      # 30 хв
-ANALYTICS_CACHE_TTL       = 900       # 15 хв на (q, channel, since_ts, until_ts)
 
 _top_words_cache: dict[tuple[str, str], tuple[float, dict]] = {}
 _top_words_inflight: set[tuple[str, str]] = set()  # (period, channel) пари в обчисленні
@@ -803,11 +803,8 @@ TEMPLATE = """
     <button type="button" class="btn-search" id="export-xlsx-btn"
             title="Завантажити поточну вибірку в .xlsx (актуальна кількість переглядів збирається з MAX на момент завантаження)"
             aria-label="Завантажити в .xlsx">💾</button>
-    {# Тимчасово прихована: тримаємо в DOM (живий JS-обробник `analytics-btn`),
-       але візуально не показуємо до подальшого рішення. #}
-    <button type="button" class="btn-search" id="analytics-btn" disabled
-            style="display:none"
-            title="Тимчасово недоступно">🧠 Аналітика</button>
+    <button type="button" class="btn-search" id="analytics-btn"
+            title="AI-аналітика постів (24h/7d) через cloud routine">🧠 Аналітика</button>
     <button type="button" class="btn-search" onclick="generatePDF(this)"
             title="Сформувати PDF-звіт того, що зараз на дашборді">📄 Звіт</button>
     {# Скидаємо лише q+channel, period (і from/to для custom) лишаємо поточним. #}
@@ -1502,10 +1499,12 @@ document.addEventListener('DOMContentLoaded', () => {
   }, 30000);
 });
 
-// ── AI-аналітика: запит до /api/analytics + рендер замість стрічки постів ────
+// ── AI-аналітика через cloud routine ──────────────────────────────────────────
+// Натискання кнопки → POST /api/analytics/start (дашборд commit'ить pack у GitHub
+// репо). Polling /api/analytics/result/<hash> — поки routine не запише результат.
 document.addEventListener('DOMContentLoaded', () => {
   const btn = document.getElementById('analytics-btn');
-  if (!btn || btn.disabled) return;
+  if (!btn) return;
   btn.addEventListener('click', startAnalytics);
 });
 
@@ -1514,18 +1513,19 @@ const ANALYTICS_ERR = {
   period_not_allowed: 'AI-аналітика доступна лише для періодів «Доба» або «Тиждень».',
   no_posts:           'За цим запитом немає постів у вибраному періоді.',
   empty_texts:        'Знайдені пости порожні — нічого аналізувати.',
-  key_missing:        'На сервері немає файлу /root/.anthropic_key — налаштуйте API-ключ Claude.',
-  key_empty:          'Файл /root/.anthropic_key порожній.',
-  sdk_missing:        'На сервері не встановлено пакет anthropic — потрібен pip install anthropic.',
+  git_failed:         'Не вдалось відправити pack у репо. Перевірте логи дашборду.',
+  bad_hash:           'Невірний hash у polling-запиті.',
 };
+
+const ANALYTICS_POLL_INTERVAL_MS = 10_000;     // 10 секунд між пробами
+const ANALYTICS_POLL_MAX_MS      = 65 * 60_000; // 65 хв (cron 1 раз/година + запас)
 
 async function startAnalytics() {
   const btn = document.getElementById('analytics-btn');
   const orig = btn.textContent;
   btn.disabled = true;
-  btn.textContent = '⏳ Аналізую...';
+  btn.textContent = '⏳ Готую pack...';
 
-  // Параметри беремо з поточного URL — рівно ті ж фільтри, що й на сторінці
   const u = new URL(window.location.href);
   const params = {
     q:         u.searchParams.get('q') || '',
@@ -1535,49 +1535,93 @@ async function startAnalytics() {
     to_date:   u.searchParams.get('to_date') || '',
   };
 
+  let startData;
   try {
-    const r = await fetch('/api/analytics', {
+    const r = await fetch('/api/analytics/start', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(params),
     });
-    if (r.status === 429) {
-      alert('Зайнято — інша AI-аналітика виконується. Спробуйте за 5 секунд.');
-      return;
-    }
     const j = await r.json();
-    if (j.error) { alert(ANALYTICS_ERR[j.error] || ('Помилка: ' + j.error)); return; }
-    if (j.state === 'done') return renderAnalytics(j.data, params.q);
-
-    while (true) {
-      await new Promise(res => setTimeout(res, 2500));
-      const s = await fetch('/api/analytics/' + j.task_id).then(x => x.json());
-      if (s.state === 'done')  return renderAnalytics(s.data, params.q);
-      if (s.state === 'error') {
-        alert(ANALYTICS_ERR[s.error] || ('Помилка: ' + s.error));
-        return;
-      }
+    if (j.error) {
+      alert(ANALYTICS_ERR[j.error] || ('Помилка: ' + j.error));
+      btn.disabled = false; btn.textContent = orig; return;
     }
+    startData = j;
   } catch (e) {
     alert('Мережева помилка: ' + e.message);
+    btn.disabled = false; btn.textContent = orig; return;
+  }
+
+  const meta = {
+    posts_used:  startData.posts_used,
+    posts_total: startData.posts_total,
+    routine_url: startData.routine_url,
+  };
+
+  // Якщо результат вже був у репо — швидкий шлях: одразу один fetch і рендер.
+  if (startData.cached) {
+    try {
+      const r = await fetch('/api/analytics/result/' + startData.hash);
+      const j = await r.json();
+      if (j.state === 'done') renderAnalytics(j.data, params.q, meta);
+      else                    alert('Результат був у репо, але зник. Спробуйте ще раз.');
+    } catch (e) {
+      alert('Мережева помилка: ' + e.message);
+    } finally {
+      btn.disabled = false; btn.textContent = orig;
+    }
+    return;
+  }
+
+  showAnalyticsPending(params.q, meta);
+  btn.textContent = '⏳ Очікую cloud routine...';
+
+  const deadline = Date.now() + ANALYTICS_POLL_MAX_MS;
+  try {
+    while (Date.now() < deadline) {
+      await new Promise(res => setTimeout(res, ANALYTICS_POLL_INTERVAL_MS));
+      const r = await fetch('/api/analytics/result/' + startData.hash);
+      const j = await r.json();
+      if (j.error) { alert(ANALYTICS_ERR[j.error] || ('Помилка: ' + j.error)); break; }
+      if (j.state === 'done') { renderAnalytics(j.data, params.q, meta); return; }
+      // 'pending' — продовжуємо
+    }
+    alert('Cloud routine не відповів за 65 хвилин. Відкрийте посилання на routine у блоці аналітики і натисніть "Run now".');
+  } catch (e) {
+    alert('Мережева помилка при polling: ' + e.message);
   } finally {
-    btn.disabled = false;
-    btn.textContent = orig;
+    btn.disabled = false; btn.textContent = orig;
   }
 }
 
-function renderAnalytics(data, q) {
+function showAnalyticsPending(q, meta) {
   document.getElementById('analytics-q').textContent = `«${q}»`;
-  const used = data.posts_used, total = data.posts_total;
-  let meta = `Проаналізовано ${used}`;
-  if (used < total) meta += ` з ${total} (обрізано через ліміт контексту)`;
-  else              meta += ` постів`;
-  meta += ` · модель ${data.model}`;
-  if (data.elapsed_sec) meta += ` · ${data.elapsed_sec}с`;
-  document.getElementById('analytics-meta').textContent = meta;
+  const used = meta.posts_used ?? '?';
+  const total = meta.posts_total ?? '?';
+  document.getElementById('analytics-meta').textContent =
+    `Pack відправлено в чергу · ${used}/${total} постів`;
+  document.getElementById('analytics-body').innerHTML =
+    `<p>Cloud routine обробить pack автоматично протягом ~1 години (запускається щогодини).</p>` +
+    `<p>Щоб не чекати — відкрий <a href="${meta.routine_url}" target="_blank" rel="noopener">сторінку routine</a> і натисни <strong>Run now</strong>. Результат з'явиться тут автоматично.</p>`;
+  document.getElementById('analytics-result').style.display = 'block';
+  const grid = document.getElementById('main-grid');
+  if (grid) grid.style.display = 'none';
+  document.getElementById('analytics-result').scrollIntoView({behavior: 'smooth', block: 'start'});
+}
+
+function renderAnalytics(data, q, meta) {
+  document.getElementById('analytics-q').textContent = `«${q}»`;
+  let metaTxt = '';
+  if (meta && meta.posts_used != null) {
+    const used = meta.posts_used, total = meta.posts_total;
+    metaTxt = `Проаналізовано ${used}`;
+    if (used < total) metaTxt += ` з ${total} (обрізано через ліміт контексту)`;
+    else              metaTxt += ` постів`;
+  }
+  document.getElementById('analytics-meta').textContent = metaTxt;
   document.getElementById('analytics-body').innerHTML = data.html;
   document.getElementById('analytics-result').style.display = 'block';
-  // Згідно ТЗ — стрічка постів ховається на час перегляду аналітики
   const grid = document.getElementById('main-grid');
   if (grid) grid.style.display = 'none';
   document.getElementById('analytics-result').scrollIntoView({behavior: 'smooth', block: 'start'});
@@ -2433,52 +2477,17 @@ def _run_reach_task(task_id: str, q: str, channel: str, days: int):
         _reach_running["busy"] = False
 
 
-# ── AI-аналітика через Claude API ─────────────────────────────────────────────
-# Promt з summary.txt + усі пости за поточним фільтром (q + period). Виклик
-# повільний (15-30с на Opus), тому async-task pattern як у reach. Глобальний
-# семафор: один Claude-запит одночасно.
+# ── AI-аналітика через cloud routine ──────────────────────────────────────────
+# Дашборд формує pack (метадані + system prompt з summary.txt + дамп постів) і
+# commit'ить як analytics/pending/<hash>.md у GitHub репо. Cloud routine
+# `trig_01BuHdcdyvecVXpjMnbmDesM` клонує репо, обробляє pending, commit'ить
+# analytics/results/<hash>.md, push. Дашборд git pull при polling.
 
-_analytics_cache:   dict[tuple, tuple[float, dict]] = {}
-_analytics_tasks:   dict[str, dict] = {}
-_analytics_lock     = threading.Lock()
-_analytics_running: dict[str, bool] = {"busy": False}
-
-
-def _analytics_gc():
-    now = time.time()
-    with _analytics_lock:
-        stale = [tid for tid, t in _analytics_tasks.items()
-                 if now - t.get("ts_done", t["ts_started"]) > ANALYTICS_TASK_TTL]
-        for tid in stale:
-            _analytics_tasks.pop(tid, None)
-
-
-def _load_anthropic_client() -> tuple[object | None, str | None]:
-    """Lazy import + ключ з файлу. Якщо є .anthropic_gateway — використовує
-    base_url проксі (для обходу гео-блоку). Повертає (client, error_code)."""
-    if not ANTHROPIC_KEY_FILE.exists():
-        return None, "key_missing"
-    key = ANTHROPIC_KEY_FILE.read_text(encoding="utf-8").strip()
-    if not key:
-        return None, "key_empty"
-    try:
-        from anthropic import Anthropic
-    except ImportError:
-        return None, "sdk_missing"
-    kwargs: dict = {"api_key": key}
-    if ANTHROPIC_GATEWAY_FILE.exists():
-        gw = ANTHROPIC_GATEWAY_FILE.read_text(encoding="utf-8").strip()
-        if gw:
-            kwargs["base_url"] = gw
-            if ANTHROPIC_GATEWAY_TOKEN_FILE.exists():
-                tok = ANTHROPIC_GATEWAY_TOKEN_FILE.read_text(encoding="utf-8").strip()
-                if tok:
-                    kwargs["default_headers"] = {"cf-aig-authorization": f"Bearer {tok}"}
-    return Anthropic(**kwargs), None
+_analytics_lock = threading.Lock()  # серіалізує git операції
 
 
 def _build_analytics_input(rows: list[sqlite3.Row]) -> tuple[str, int]:
-    """Серіалізує пости у блок тексту для Claude. Дуже довгі обрізає, зупиняється
+    """Серіалізує пости у блок тексту для AI. Дуже довгі обрізає, зупиняється
     при досягненні ANALYTICS_MAX_INPUT_CHARS. Повертає (text, used_count)."""
     parts: list[str] = []
     used = 0
@@ -2499,8 +2508,8 @@ def _build_analytics_input(rows: list[sqlite3.Row]) -> tuple[str, int]:
 
 
 def _md_to_html(md: str) -> str:
-    """Мінімальний md→html для відповіді Claude (## заголовки, **bold**,
-    нумеровані списки, абзаци). HTML-escape всього іншого. Без зовнішніх залежностей."""
+    """Мінімальний md→html (## заголовки, **bold**, нумеровані списки, абзаци).
+    HTML-escape всього іншого. Без зовнішніх залежностей."""
     from html import escape
     out: list[str] = []
     para: list[str] = []
@@ -2530,84 +2539,81 @@ def _md_to_html(md: str) -> str:
     return "\n".join(out)
 
 
-def _run_analytics_task(task_id: str, q: str, channel: str,
-                        since_ts: str | None, until_ts: str | None):
-    task = _analytics_tasks[task_id]
+def _compute_pack_hash(q: str, channel: str, since_ts: str | None,
+                       until_ts: str | None) -> str:
+    """Детермінований hash параметрів запиту. 16 hex — повторний клік з тими
+    самими фільтрами одразу побачить попередній результат."""
+    key = f"{q}|{channel}|{since_ts or ''}|{until_ts or ''}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+def _git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    """Викликати git у репо. timeout 30с — щоб push не залип назавжди."""
+    return subprocess.run(
+        ["git", "-C", str(ANALYTICS_REPO_DIR), *args],
+        capture_output=True, text=True, timeout=30, check=check,
+    )
+
+
+def _git_pull() -> None:
+    """Fast-forward pull. Тиха помилка, якщо нема мережі — наступний polling
+    спробує знову."""
     try:
-        db = get_db()
+        _git("pull", "--ff-only", "--quiet", "origin", "main")
+    except (subprocess.SubprocessError, OSError) as e:
+        print(f"[analytics] git pull failed: {e}", flush=True)
+
+
+def _build_pack_md(hash_: str, q: str, channel: str, period: str,
+                   since_ts: str | None, until_ts: str | None,
+                   posts_text: str, posts_used: int, posts_total: int) -> str:
+    """Серіалізує pack у markdown для cloud routine. Заголовок (метадані),
+    SYSTEM PROMPT (із summary.txt), POSTS (дамп)."""
+    system_prompt = SUMMARY_PROMPT_FILE.read_text(encoding="utf-8").strip()
+    header = (
+        "# max-parser analytics pack\n"
+        f"# hash: {hash_}\n"
+        f"# q: {q}\n"
+        f"# channel: {channel or '(усі)'}\n"
+        f"# period: {period}\n"
+        f"# since_ts: {since_ts or ''}\n"
+        f"# until_ts: {until_ts or ''}\n"
+        f"# posts: {posts_used} (used) / {posts_total} (total)\n"
+        f"# generated_at: {datetime.now().isoformat(timespec='seconds')}\n"
+    )
+    return f"{header}\n## SYSTEM PROMPT\n{system_prompt}\n\n## POSTS\n{posts_text}"
+
+
+def _commit_and_push_pack(hash_: str, pack_md: str, q: str, period: str) -> bool:
+    """Записує pack у pending/, commit, push. Серіалізовано через
+    _analytics_lock — уникнення race для git operations."""
+    target = ANALYTICS_PENDING_DIR / f"{hash_}.md"
+    with _analytics_lock:
+        _git_pull()
+        target.write_text(pack_md, encoding="utf-8")
         try:
-            rows = _query_export_rows(db, q, channel, since_ts, until_ts, sort="new")
-        finally:
-            db.close()
+            _git("add", f"analytics/pending/{hash_}.md")
+            _git("commit", "-m",
+                 f"analytics: pack {hash_[:8]} (q={q!r}, period={period})")
+            _git("push", "--quiet", "origin", "main")
+            return True
+        except (subprocess.SubprocessError, OSError) as e:
+            print(f"[analytics] commit/push failed for {hash_}: {e}", flush=True)
+            try:
+                target.unlink()
+            except OSError:
+                pass
+            return False
 
-        if not rows:
-            task.update(state="error", error="no_posts", ts_done=time.time())
-            return
 
-        posts_total = len(rows)
-        posts_text, posts_used = _build_analytics_input(rows)
-        if posts_used == 0:
-            task.update(state="error", error="empty_texts", ts_done=time.time())
-            return
-
-        try:
-            system_prompt = SUMMARY_PROMPT_FILE.read_text(encoding="utf-8").strip()
-        except OSError as e:
-            task.update(state="error", error=f"prompt_read: {e}", ts_done=time.time())
-            return
-
-        client, err = _load_anthropic_client()
-        if err:
-            task.update(state="error", error=err, ts_done=time.time())
-            return
-
-        period_descr = ""
-        if since_ts and until_ts:
-            period_descr = f"з {since_ts} по {until_ts}"
-        elif since_ts:
-            period_descr = f"з {since_ts} по теперішній час"
-        else:
-            period_descr = "за весь час"
-
-        user_msg = (
-            f"Ключове слово пошуку: «{q}»\n"
-            f"Канал: {channel or '(усі канали)'}\n"
-            f"Період: {period_descr}\n"
-            f"Постів у вибірці: {posts_used} з {posts_total}\n\n"
-            f"=== ПОСТИ ===\n{posts_text}"
-        )
-
-        task["state"] = "running"
-        print(f"[analytics] start: q={q!r} channel={channel!r} posts={posts_used}/{posts_total} chars={len(posts_text)}",
-              flush=True)
-        t0 = time.time()
-        resp = client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=2_500,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        elapsed = time.time() - t0
-        answer = resp.content[0].text
-        print(f"[analytics] done in {elapsed:.1f}s, answer={len(answer)} chars", flush=True)
-
-        result = {
-            "markdown": answer,
-            "html": _md_to_html(answer),
-            "posts_total": posts_total,
-            "posts_used": posts_used,
-            "model": ANTHROPIC_MODEL,
-            "elapsed_sec": round(elapsed, 1),
-        }
-        task.update(state="done", data=result, ts_done=time.time())
-        cache_key = (q, channel, since_ts or "", until_ts or "")
-        with _analytics_lock:
-            _analytics_cache[cache_key] = (time.time(), result)
-    except Exception as e:
-        print(f"[analytics] error: {e}", flush=True)
-        task.update(state="error", error=f"exception: {e}", ts_done=time.time())
-    finally:
-        _analytics_running["busy"] = False
+def _read_result(hash_: str) -> str | None:
+    """Git pull + читає results/<hash>.md якщо є. None якщо ще не з'явився."""
+    with _analytics_lock:
+        _git_pull()
+    path = ANALYTICS_RESULTS_DIR / f"{hash_}.md"
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8")
 
 
 _ALLOWED_TIMELINE_DAYS = (7, 30, 90)
@@ -3139,10 +3145,13 @@ def api_timeline_reach_status(task_id: str):
 _ANALYTICS_ALLOWED_PERIODS = ("24h", "7d")
 
 
-@app.route("/api/analytics", methods=["POST"])
+@app.route("/api/analytics/start", methods=["POST"])
 def api_analytics_start():
+    """Формує pack, commit+push у GitHub. Cloud routine далі обробить.
+    Повертає {hash, routine_url, posts_used, posts_total, cached?} — фронт
+    polling'ить /api/analytics/result/<hash>."""
     data = request.json or {}
-    q       = (data.get("q") or "").strip()
+    q = (data.get("q") or "").strip()
     if not q:
         return jsonify({"error": "q_required"}), 400
     channel = (data.get("channel") or "").strip()
@@ -3150,52 +3159,61 @@ def api_analytics_start():
     if period_in not in _ANALYTICS_ALLOWED_PERIODS:
         return jsonify({"error": "period_not_allowed"}), 400
     from_date = (data.get("from_date") or "").strip()
-    to_date   = (data.get("to_date") or "").strip()
+    to_date = (data.get("to_date") or "").strip()
     since_ts, until_ts, _ = parse_time_filter(period_in, from_date, to_date)
 
-    cache_key = (q, channel, since_ts or "", until_ts or "")
-    with _analytics_lock:
-        cached = _analytics_cache.get(cache_key)
-        if cached and time.time() - cached[0] < ANALYTICS_CACHE_TTL:
-            return jsonify({
-                "task_id": "cached", "state": "done",
-                "data": cached[1], "cached": True,
-            })
+    hash_ = _compute_pack_hash(q, channel, since_ts, until_ts)
 
-    _analytics_gc()
+    # Якщо результат вже є — не пересоздаємо pack.
+    if _read_result(hash_) is not None:
+        return jsonify({
+            "hash": hash_, "routine_url": ANALYTICS_ROUTINE_URL,
+            "cached": True,
+        })
 
-    with _analytics_lock:
-        if _analytics_running["busy"]:
-            return jsonify({"error": "busy", "retry_after": 5}), 429
-        _analytics_running["busy"] = True
-        task_id = uuid.uuid4().hex[:12]
-        _analytics_tasks[task_id] = {
-            "state": "pending",
-            "ts_started": time.time(),
-            "params": {"q": q, "channel": channel,
-                       "since_ts": since_ts, "until_ts": until_ts},
-        }
+    db = get_db()
+    try:
+        rows = _query_export_rows(db, q, channel, since_ts, until_ts, sort="new")
+    finally:
+        db.close()
 
-    threading.Thread(
-        target=_run_analytics_task,
-        args=(task_id, q, channel, since_ts, until_ts), daemon=True
-    ).start()
+    if not rows:
+        return jsonify({"error": "no_posts"}), 404
 
-    return jsonify({"task_id": task_id, "state": "pending"})
+    posts_total = len(rows)
+    posts_text, posts_used = _build_analytics_input(rows)
+    if posts_used == 0:
+        return jsonify({"error": "empty_texts"}), 404
+
+    pack_md = _build_pack_md(hash_, q, channel, period_in, since_ts, until_ts,
+                             posts_text, posts_used, posts_total)
+    if not _commit_and_push_pack(hash_, pack_md, q, period_in):
+        return jsonify({"error": "git_failed"}), 500
+
+    return jsonify({
+        "hash": hash_,
+        "routine_url": ANALYTICS_ROUTINE_URL,
+        "posts_used": posts_used,
+        "posts_total": posts_total,
+    })
 
 
-@app.route("/api/analytics/<task_id>")
-def api_analytics_status(task_id: str):
-    with _analytics_lock:
-        task = _analytics_tasks.get(task_id)
-    if not task:
-        return jsonify({"error": "unknown_task"}), 404
-    out = {"state": task["state"]}
-    if task["state"] == "done":
-        out["data"] = task["data"]
-    elif task["state"] == "error":
-        out["error"] = task.get("error", "unknown")
-    return jsonify(out)
+@app.route("/api/analytics/result/<hash_>")
+def api_analytics_result(hash_: str):
+    """Git pull + перевірка results/<hash>.md. Якщо є — {state: done,
+    data: {markdown, html}}; якщо нема — {state: pending}."""
+    if not re.match(r"^[0-9a-f]{16}$", hash_):
+        return jsonify({"error": "bad_hash"}), 400
+    md = _read_result(hash_)
+    if md is None:
+        return jsonify({"state": "pending"})
+    return jsonify({
+        "state": "done",
+        "data": {
+            "markdown": md,
+            "html": _md_to_html(md),
+        },
+    })
 
 
 @app.route("/api/top-words")
