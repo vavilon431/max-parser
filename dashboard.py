@@ -1602,8 +1602,8 @@ function showAnalyticsPending(q, meta) {
   document.getElementById('analytics-meta').textContent =
     `Pack відправлено в чергу · ${used}/${total} постів`;
   document.getElementById('analytics-body').innerHTML =
-    `<p>Cloud routine обробить pack автоматично протягом ~1 години (запускається щогодини).</p>` +
-    `<p>Щоб не чекати — відкрий <a href="${meta.routine_url}" target="_blank" rel="noopener">сторінку routine</a> і натисни <strong>Run now</strong>. Результат з'явиться тут автоматично.</p>`;
+    `<p>GitHub Action автоматично запустив cloud routine. Результат з'явиться тут через ~1-2 хвилини.</p>` +
+    `<p>Якщо нічого не сталось протягом 5 хвилин — відкрий <a href="${meta.routine_url}" target="_blank" rel="noopener">сторінку routine</a> для діагностики (там видно статус, помилки і кнопку Run now як fallback).</p>`;
   document.getElementById('analytics-result').style.display = 'block';
   const grid = document.getElementById('main-grid');
   if (grid) grid.style.display = 'none';
