@@ -34,6 +34,8 @@ RECONNECT_DELAY      = 20    # секунд перед reconnect
 CONNECT_TIMEOUT      = 30    # секунд на повний connect+handshake+login
 SUBSCRIBE_TIMEOUT    = 60    # секунд на цикл підписки на канали
 IDLE_TIMEOUT         = 600   # секунд без push → форс-реконнект (захист від мовчазних розривів)
+WORKER_START_STAGGER = 20    # секунд між стартом воркерів — розмазує rate-limit MAX при subscribe
+RESUBSCRIBE_INTERVAL = 300   # секунд між повторними subscribe — добирає дроп'нуті при старті
 
 # ── Утиліти ───────────────────────────────────────────────────────────────────
 
@@ -283,6 +285,24 @@ async def worker(worker_id: int, token: str, device_id: str,
             ))
             await asyncio.sleep(0.03)
 
+    async def rolling_resubscribe(c: WSClient):
+        """Кожні RESUBSCRIBE_INTERVAL секунд заново subscribe всі канали воркера.
+        Захист від MAX rate-limit на старті — частина op=75 fire-and-forget команд
+        може мовчки дроп'нутися, а парсер цього не помічає (немає ACK). Повторні
+        subscribe добирають пропущені."""
+        while True:
+            await asyncio.sleep(RESUBSCRIBE_INTERVAL)
+            try:
+                for chat_id in chat_ids:
+                    await c._ws.send(make_msg(
+                        c._ns(), 75, {"chatId": chat_id, "subscribe": True}
+                    ))
+                    await asyncio.sleep(0.03)
+                log(f"Rolling re-subscribe: {len(chat_ids)} каналів")
+            except Exception as e:
+                log(f"Re-subscribe error: {e}")
+                return
+
     async def idle_watchdog(c: WSClient):
         """Якщо WS живий, але push'ів немає > IDLE_TIMEOUT — форс-реконнект."""
         while True:
@@ -331,11 +351,13 @@ async def worker(worker_id: int, token: str, device_id: str,
                     log(f"Підписка відправлена. Слухаємо push...")
                     client.last_activity = time.monotonic()
 
-                    # Чекаємо: або recv_loop падає (розрив), або idle_watchdog (мовчанка)
+                    # Чекаємо: recv_loop падає (розрив) АБО idle_watchdog (мовчанка).
+                    # rolling_resubscribe працює фоном і теж може впасти при обриві ws.
                     wd_task = asyncio.create_task(idle_watchdog(client))
+                    rs_task = asyncio.create_task(rolling_resubscribe(client))
                     try:
                         done, _pending = await asyncio.wait(
-                            {client._recv_task, wd_task},
+                            {client._recv_task, wd_task, rs_task},
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                         for t in done:
@@ -343,8 +365,9 @@ async def worker(worker_id: int, token: str, device_id: str,
                             if exc and not isinstance(exc, asyncio.CancelledError):
                                 raise exc
                     finally:
-                        if not wd_task.done():
-                            wd_task.cancel()
+                        for t in (wd_task, rs_task):
+                            if not t.done():
+                                t.cancel()
 
         except (websockets.ConnectionClosed, OSError) as e:
             log(f"З'єднання розірвано: {e}. Reconnect через {RECONNECT_DELAY}s...")
@@ -384,8 +407,16 @@ async def main():
     print(f"[{ts()}] База даних: {DB_FILE}", flush=True)
     print(f"[{ts()}] Моніторинг запущено. Ctrl+C для зупинки.\n", flush=True)
 
+    async def staggered_worker(i: int, group: dict[str, dict]):
+        """Затримка перед стартом — розмазує subscribe-traffic у часі, щоб не
+        потрапляти у MAX rate-limit (це і було причиною ~25% пропуску каналів
+        на старших воркерах W3-W7 до 2026-05-19)."""
+        if i > 0:
+            await asyncio.sleep(i * WORKER_START_STAGGER)
+        await worker(i, token, device_id, group, resolved, db, label=label)
+
     tasks = [
-        asyncio.create_task(worker(i, token, device_id, group, resolved, db, label=label))
+        asyncio.create_task(staggered_worker(i, group))
         for i, group in enumerate(groups)
     ]
     tasks.append(asyncio.create_task(commit_watchdog(db)))
