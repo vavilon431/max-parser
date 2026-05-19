@@ -1,0 +1,26 @@
+[Unit]
+Description=Backfill stale channels via op=49 — догон постів які WS push не отримав
+After=network-online.target
+Wants=network-online.target
+# Конфлікт: backfill_missed і max-parser-b використовують той самий токен B
+# (MAX дозволяє лише одну сесію на токен). Без зупинки B WS-сесія дроп'ає
+# одна одну і обидва нестабільні.
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root
+Environment=BACKFILL_TOKEN_FILE=/root/.login_token_b
+Environment=BACKFILL_DEVICE_FILE=/root/.device_id_b
+ExecStartPre=/bin/systemctl stop max-parser-b.service
+ExecStart=/usr/bin/python3 -u /root/backfill_missed.py
+ExecStartPost=/bin/systemctl start max-parser-b.service
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=backfill-missed
+# Жорстке обмеження часу: timer кожні 15 хв, тут — макс 10 хв на прохід
+TimeoutStartSec=600
+MemoryMax=300M
+
+[Install]
+WantedBy=multi-user.target

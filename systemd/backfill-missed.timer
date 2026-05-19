@@ -1,0 +1,16 @@
+[Unit]
+Description=Trigger backfill-missed every 15 min
+# WS-парсер (op=75 subscribe) мовчки дроп'ає підписку для частини каналів —
+# probe_subscribe_limit.py показав 2/200 push events за 30 хв замість ~190.
+# Поллінг op=49 на stale-канали (без свіжих постів у БД >10 хв) гарантує
+# покриття цих "невидимих" для push каналів. Lag — до 15 хв.
+
+[Timer]
+# Кожні 15 хв (7, 22, 37, 52 хв години — offset 7 від :00 і :30 щоб не
+# збігатися з backfill-priority.timer що ходить о :00 і :30)
+OnCalendar=*:07/15
+Persistent=true
+Unit=backfill-missed.service
+
+[Install]
+WantedBy=timers.target
