@@ -61,6 +61,12 @@ NLP-пайплайн категоризує всі значущі токени �
 
 Якщо в топ просочується щось побутове (автомобіль, сніг тощо) — або додавати в `_RU_EXTRA` всередині `dashboard.py`, або через ✕-кнопку UI (пише в `custom_stop_words.txt`). Якщо натомість бракує тематичного терміну — додати корінь у [topical_roots.txt](topical_roots.txt).
 
+**Періодичний audit якості:** `python3 audit_missing_roots.py` бере 5000 random постів за 7 днів, прогоняє Natasha БЕЗ topical-фільтра і виводить `audit_missing_roots_report.txt` — топ-300 лем поза `topical_roots.txt` що були б у топі. Дивишся:
+- **Реально тематичні** → додавай корінь у `topical_roots.txt`
+- **Шум** (місяці, побутове) → додавай у `_RU_EXTRA` в [dashboard.py](dashboard.py)
+
+Після додавання стоп-слів — обов'язково очищай кеш від уже накопиченого: `DELETE FROM message_lemmas WHERE lemma IN (...)` через `sqlite3` з `busy_timeout=120000` (dashboard має бути зупинений або працювати — Python з timeout сам почекає WAL). Після додавання нових коренів повний rebuild не потрібний — нові пости підхопляться автоматично через `lemma_cache_scheduler`.
+
 ### Чому `get_top_words` неблокуюча
 
 NER+syntax-пайплайн ~30-60 мс/пост. На 3000 постів (`MAX_ROWS_SCAN`) — ~30-60 с. Тому:
