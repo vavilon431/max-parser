@@ -47,6 +47,8 @@ systemctl start max-parser
 
 5. **`views_fetcher.py`** — модуль для отримання кількості переглядів постів. Окрема WS-сесія, `op=49` (getMessages), групує пости по `chat_id`. Викликається з `dashboard.py` в рамках reach-задачі. **Не запускається паралельно з парсером** — MAX дозволяє лише одну активну сесію на токен.
 
+6. **`backfill_priority.py`** + **`backfill_missed.py`** — поллінг через op=49 як компенсація WS-пропусків. Push (op=75 subscribe) має непрозорий drop rate і для частини каналів мовчки відхиляється MAX-сервером (підтверджено `probe_subscribe_limit.py`: 2/200 push events за 30 хв на топ-active missed). Backfill через op=49 догоняє всі прогалини, INSERT OR IGNORE через UNIQUE(chat_id, msg_id) робить запуски ідемпотентними. Два systemd timer'и: `backfill-priority.timer` (кожні 30 хв, топ-300 main-flow) і `backfill-missed.timer` (кожні 15 хв, ВСI канали без свіжих постів >10 хв). Обидва через токен B, з stop/start `max-parser-b` навколо запуску (одна сесія на токен).
+
 ## Топ слів — як це працює (ядро поточного UX)
 
 NLP-пайплайн категоризує всі значущі токени на 4 групи:
