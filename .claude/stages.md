@@ -3,6 +3,37 @@
 
 ---
 
+## [2026-05-26 16:00] — Аудит CLAUDE.md проти реального стану + cleanup застарілих залежностей
+
+**Контекст:** після save-stage сьогодні (15:53) користувач викликав `/init` для max-parser. Аудит виявив що `CLAUDE.md` відстав від реальності у 4 областях: multi-token не задокументований як окрема архітектурна одиниця (тільки побіжно у backfill-секції), auth дашборду відсутня цілком (з 04.05 v3.8), QR-rotation для перевипуску токенів не описана, перелік сервісів і файлів деплою застарів (5 нових сервісів і 7 файлів з'явились з v3.4+). Плюс знайдено два мертвих артефакти: `anthropic>=0.40.0` у `requirements.txt` (не використовується після переходу на cloud routine 16.05) і `russian_baseline.txt` (10000 рядків антипатерна, замінено власним baseline з БД 25.04).
+
+**Ключові зміни:**
+
+[CLAUDE.md](../CLAUDE.md) — +105/-15 рядків:
+- Нова секція **«Сервіси на VPS»** з таблицею всіх 6 unit'ів (live A+B, dashboard, 3 таймери).
+- Нова секція **«Multi-account / multi-token»**: env vars (`WS_PARSER_LABEL`, `WS_PARSER_TOKEN_FILE`, `WS_PARSER_DEVICE_FILE`, `BACKFILL_TOKEN_FILE`), розподіл ролей (A — live, B — live+backfill), поведінка при деградації одного токена.
+- Нова секція **«Перевипуск токена (QR-rotation)»**: повний workflow `pw_qr_a.py`/`pw_qr_b.py` (stop сервіс → setsid nohup → scp screenshot → сканування з телефону + підтвердження → перевірка лога → старт сервіс). Зафіксовано підводний камінь: TTL свіжого QR ~30с, скрипт не клікає «Получить новый QR-код» — треба рестарт `pw_qr_*.py` при `«QR-код устарел»`.
+- Нова секція **«Auth дашборду»**: `manage_auth.py` CLI, `.dashboard_auth` (pbkdf2), `.dashboard_secret` (Flask SECRET_KEY), TTL кеша `_load_auth_users` 60с.
+- Розширено архітектуру з 6 до 7 шарів: `ws_common.py` додано як 0-й (спільний WS handshake, читання токена/device_id, параметризований під multi-account).
+- Оновлено розділ **«Деплой і експлуатація»**: розширено перелік файлів коду (додано `ws_common.py`, `views_fetcher.py`, `backfill_*.py`, `manage_auth.py`, `summary.txt`, `pw_qr_*.py`), окремо виділено файли стану (`.login_token*`, `.device_id*`, `.dashboard_*`, `matches.db`).
+- Доповнено розділ **«Розвідка / WebSocket protocol»**: розділено auth-flow на «первий запуск з паролем» (`ws_auth_scout.py`) і «перевипуск через QR» (`pw_qr_*.py`); додано **«Діагностичні скрипти»** — `probe_subscribe_limit.py`, `check_dead_channels.py`, `audit_missing_roots.py`.
+
+Cleanup застарілих артефактів:
+- [requirements.txt](../requirements.txt): `-anthropic>=0.40.0` (grep підтвердив 0 імпортів у репо, видалено разом зі старим API-flow 16.05).
+- `russian_baseline.txt`: видалено (-10000 рядків). Замінено власним baseline з БД через `baseline_lemma_freq` таблицю ще 25.04 у v3.
+
+**Поточний стан:**
+- Робоча копія чиста, 2 нових коміти попереду origin/main: `9c8510e` (попередній save-stage) і `09d069a` (поточні правки).
+- Реальна архітектура (multi-token + auth + QR-rotation) тепер 1-в-1 відображена в `CLAUDE.md` — нові інстанції Claude Code не повторюватимуть аудит-роботу.
+- `requirements.txt` подався на ~7 МБ легше, репо без 166 КБ мертвого тексту.
+
+**Наступний крок:**
+1. `git push origin main` коли треба синхронізувати оновлений `CLAUDE.md` з GitHub-репо `vavilon431/max-parser` (потрібен для cloud routine analytics, але документація туди не критична).
+2. Завершити перевипуск токена A через `pw_qr_a.py` (відкладено зі стейджа 26.05 14:00) — інструкція тепер у `CLAUDE.md`.
+3. Опціонально: у `pw_qr_a.py` / `pw_qr_b.py` додати auto-click на кнопку «Получить новый QR-код» через playwright — щоб TTL ~30с не різав вікно сканування. Зараз кожне протухання QR = повний рестарт скрипта.
+
+---
+
 ## [2026-05-26 14:00] — Backup matches.db на диск D + виявлено прострочений токен A (перевипуск відкладено)
 
 **Контекст:** після перевірки стану VPS (uptime 5 хв після несподіваного ребуту 23.05) виявилось, що всі 8 воркерів `max-parser` повертають `FAIL_LOGIN_TOKEN`. Файл `/root/.login_token` датований 23 квітня — токен А прострочений / відкликаний MAX (місяць активності з KZ-IP). Live-парсинг тримається тільки на токені B (`max-parser-b`) + два backfill-таймери (priority/missed) через B-токен. Покриття live-години впало назад до single-token рівня (до 14.05 multi-token stage), але загальний темп (35k постів/24h, top-15 каналів активні) виглядає здорово завдяки backfill через op=49.
