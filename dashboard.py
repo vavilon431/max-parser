@@ -2231,7 +2231,7 @@ def get_top_channels(db, q: str, since_ts: str | None, until_ts: str | None,
 
     sql = (f"SELECT {title_col} AS channel_title, {link_col} AS channel_link, "
            f"       COUNT(*) AS cnt {tc_from} "
-           f"GROUP BY {title_col} ORDER BY cnt DESC LIMIT 20")
+           f"GROUP BY {link_col} ORDER BY cnt DESC LIMIT 20")
 
     try:
         rows = db.execute(sql, params).fetchall()
@@ -2276,7 +2276,7 @@ def get_top_channels_total(db, q: str, since_ts: str | None, until_ts: str | Non
         params.extend(alert_links)
 
     try:
-        return db.execute(f"SELECT COUNT(DISTINCT {title_col}) {tc_from}", params).fetchone()[0] or 0
+        return db.execute(f"SELECT COUNT(DISTINCT {link_col}) {tc_from}", params).fetchone()[0] or 0
     except sqlite3.OperationalError:
         return 0
 

@@ -3,6 +3,37 @@
 
 ---
 
+## [2026-05-28 14:45] — Фікс AI-аналітики (429-ліміт routine) + радикальне прискорення дашборду
+
+**Контекст:** дві окремі проблеми, виявлені за одну сесію. (1) AI-аналітика перестала віддавати результати — останній був 19.05, новий pack застрягав. (2) Дашборд відповідав дуже довго, головна сторінка взагалі таймаутила (>120с).
+
+**Ключові зміни:**
+
+AI-аналітика — корінь 429 на fire-endpoint:
+- Routine `max-parser-analytics` стояла на cron `Hourly at :07` = 24 заплановані запуски/добу проти стелі плану **15 included runs/день**. Routine вичерпувала ліміт на холостих спрацюваннях (порожній `pending/`), і реальний pack ловив `429 Too Many Requests`. Усе інше (дашборд-pack, git push, GitHub Action, токени) — справне.
+- **Рішення:** користувач прибрав cron у routine на claude.ai → тепер тільки fire-on-push (запуск лише коли GitHub Action штовхає новий pack). Повторно обробити запушений pack = re-run відповідного Action.
+- [CLAUDE.md](../CLAUDE.md): прибрано згадки cron `7 * * * *` у Flow і блоці «Тригер routine», додано пояснення 429-ліміту + симптом `15/15 included daily runs used` (скидається опівночі UTC).
+
+Дашборд — діагностика «довгої реакції» (3 окремі причини):
+1. **Поллери:** дві відкриті вкладки дашборду безперервно (кожні 15с) поллили `top-words?channel=Интерфакс` і `?channel=ТАСС`. Per-channel NLP не встигав на забитому ядрі → JS бачив порожньо → ретрай → порочне коло. Тримало load average ~8 на 1 vCPU. Закриття вкладок: load 7.7 → 1.0.
+2. **MemoryMax:** дашборд упирався в 800 МБ cap (RSS рівно 813 МБ). Підняв [systemd/max-dashboard.service](../systemd/max-dashboard.service) `MemoryMax=800M → 1200M` (VPS має 2 ГБ, parser-b їсть лише ~90 МБ). Рестарт заодно очистив роздутий in-memory lemma-cache (813 → 143 МБ).
+3. **Головний винуватець timeout — `GROUP BY channel_title`:** робив повний скан 910k постів + TEMP B-TREE (23.8с на запит), а головна викликає `get_top_channels` у режимах main+alert+2×total → сумарно >120с → timeout. Спроба індексу `idx_channel_title` дала covering для mode=all (0.047с), але для main/alert (фільтр `lower(channel_link)`) зробила ГІРШЕ (91с — index scan + 910k rowid-lookup'ів). **Рішення:** [dashboard.py](../dashboard.py) `get_top_channels`/`get_top_channels_total` — `GROUP BY channel_title` → `GROUP BY channel_link`, `COUNT(DISTINCT channel_title)` → `channel_link`. Використовує наявний `idx_channel` (на channel_link) → 91с → 2.8с. Бонус: однойменні канали з різними посиланнями більше не зливаються в один рядок (давній відомий баг з травня).
+
+**Поточний стан:**
+- Дашборд: головна `/` timeout >120с → **7.2с холодна / 0.16-0.52с тепла**; пошук `/?q=путин` 32-111с → **1.8с холодний / 0.23с теплий**.
+- AI-аналітика технічно справна, routine на fire-on-push.
+- Парсер живий: ~53k постів/добу, B-токен + backfill тримають потік.
+- **На VPS додано індекс `idx_channel_title`** (стан БД, не в репо) — прискорює автокомпліт каналів (`get_channel_list` DISTINCT channel_title). Якщо БД відновлюватимуть із backup — індекс треба перестворити: `CREATE INDEX idx_channel_title ON messages(channel_title);`.
+- max-parser (токен A) — досі inactive з 23.05.
+
+**Наступний крок:**
+1. Користувачу: змінити пароль `user1` (засвітився в сесії під час тестів latency).
+2. Завершити перевипуск токена A через `pw_qr_a.py` (тягнеться з 23.05; інструкція в CLAUDE.md, доступ через WARP є).
+3. Опціонально: винести stat-агрегації (`get_stats`, top-channels) в async-прогрів при старті + більший TTL, щоб і перший (холодний) запит головної був миттєвим, а не 7с.
+4. Опціонально: підняти `actions/checkout@v4 → v5` у fire-routine.yml (Node 20 deprecation, форс із 2 червня).
+
+---
+
 ## [2026-05-27 14:20] — Доступ до VPS відновлено через WARP (aeza блокує UA-IP після переїзду)
 
 **Контекст:** після переїзду на новий ThinkStation (~26.05) пропав SSH-доступ до `max-vps` — `ssh`, `ping`, TCP на 22/80/443/8080 усі timeout, `tracert` обривався в aeza-мережі. Користувач підтвердив що VPS працює (через aeza-панель) і нічого не блокував вручну. Спершу схоже на firewall — але діагностика на VPS (через VNC web-console) показала: ufw inactive, iptables усі ланцюги `policy ACCEPT` 0 правил, hosts.allow/deny порожні, fail2ban не встановлений, sshd_config без AllowUsers. Тобто на VPS НІЩО не блокує. Перевірка з третіх точок через check-host.net: пінг до VPS OK з Канади/Китаю, timeout з України/Ірану. Висновок — aeza-KZ ріже вхідний трафік з UA-IP на рівні своєї мережі (geo-фільтр), наш новий зовнішній IP `213.160.137.117` під нього потрапив.

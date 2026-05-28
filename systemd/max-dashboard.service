@@ -16,8 +16,8 @@ RestartSec=15
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=max-dashboard
-# Natasha + Flask — до 800 МБ
-MemoryMax=800M
+# Natasha + Flask + lemma-cache — до 1200 МБ (VPS має 2 ГБ; parser-b ~90 МБ, лишається запас)
+MemoryMax=1200M
 
 [Install]
 WantedBy=multi-user.target
