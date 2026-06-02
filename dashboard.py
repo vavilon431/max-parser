@@ -66,6 +66,9 @@ ANALYTICS_ROUTINE_URL     = f"https://claude.ai/code/routines/{ANALYTICS_ROUTINE
 SUMMARY_PROMPT_FILE       = Path(__file__).parent / "summary.txt"
 ANALYTICS_MAX_INPUT_CHARS = 600_000   # ~150k токенів — безпечний поріг для context 200k
 ANALYTICS_POST_TRIM_CHARS = 1_500     # обрізання дуже довгих постів
+ANALYTICS_MAX_ROWS        = 6_000     # стеля вибірки постів для паку (без q вибірка
+                                      # за добу по всіх каналах інакше тягне сотні тисяч
+                                      # рядків у 800МБ-процес; _build однаково ріже на CHARS)
 
 _top_words_cache: dict[tuple[str, str], tuple[float, dict]] = {}
 _top_words_inflight: set[tuple[str, str]] = set()  # (period, channel) пари в обчисленні
@@ -149,6 +152,9 @@ _LOGIN_TEMPLATE = """<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Вхід — MAX Radar</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iNyIgZmlsbD0iIzBkMTAyMCIvPjxjaXJjbGUgY3g9IjE2IiBjeT0iMTYiIHI9IjEwLjUiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzZjNjNmZiIgc3Ryb2tlLXdpZHRoPSIxLjQiIG9wYWNpdHk9Ii40NSIvPjxjaXJjbGUgY3g9IjE2IiBjeT0iMTYiIHI9IjYiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzZjNjNmZiIgc3Ryb2tlLXdpZHRoPSIxLjQiIG9wYWNpdHk9Ii43Ii8+PHBhdGggZD0iTTE2IDE2IEwxNiA1LjUgQTEwLjUgMTAuNSAwIDAgMSAyNS41IDEzLjUgWiIgZmlsbD0iIzZjNjNmZiIgb3BhY2l0eT0iLjM1Ii8+PGxpbmUgeDE9IjE2IiB5MT0iMTYiIHgyPSIxNiIgeTI9IjUuNSIgc3Ryb2tlPSIjOGI4M2ZmIiBzdHJva2Utd2lkdGg9IjEuNiIvPjxjaXJjbGUgY3g9IjIyIiBjeT0iMTAiIHI9IjIuMiIgZmlsbD0iIzM4YmRmOCIvPjwvc3ZnPg==">
+  <link rel="alternate icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iNyIgZmlsbD0iIzBkMTAyMCIvPjxjaXJjbGUgY3g9IjE2IiBjeT0iMTYiIHI9IjEwLjUiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzZjNjNmZiIgc3Ryb2tlLXdpZHRoPSIxLjQiIG9wYWNpdHk9Ii40NSIvPjxjaXJjbGUgY3g9IjE2IiBjeT0iMTYiIHI9IjYiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzZjNjNmZiIgc3Ryb2tlLXdpZHRoPSIxLjQiIG9wYWNpdHk9Ii43Ii8+PHBhdGggZD0iTTE2IDE2IEwxNiA1LjUgQTEwLjUgMTAuNSAwIDAgMSAyNS41IDEzLjUgWiIgZmlsbD0iIzZjNjNmZiIgb3BhY2l0eT0iLjM1Ii8+PGxpbmUgeDE9IjE2IiB5MT0iMTYiIHgyPSIxNiIgeTI9IjUuNSIgc3Ryb2tlPSIjOGI4M2ZmIiBzdHJva2Utd2lkdGg9IjEuNiIvPjxjaXJjbGUgY3g9IjIyIiBjeT0iMTAiIHI9IjIuMiIgZmlsbD0iIzM4YmRmOCIvPjwvc3ZnPg==">
+  <meta name="theme-color" content="#080b14">
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     body {
@@ -273,6 +279,9 @@ TEMPLATE = """
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MAX Radar</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iNyIgZmlsbD0iIzBkMTAyMCIvPjxjaXJjbGUgY3g9IjE2IiBjeT0iMTYiIHI9IjEwLjUiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzZjNjNmZiIgc3Ryb2tlLXdpZHRoPSIxLjQiIG9wYWNpdHk9Ii40NSIvPjxjaXJjbGUgY3g9IjE2IiBjeT0iMTYiIHI9IjYiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzZjNjNmZiIgc3Ryb2tlLXdpZHRoPSIxLjQiIG9wYWNpdHk9Ii43Ii8+PHBhdGggZD0iTTE2IDE2IEwxNiA1LjUgQTEwLjUgMTAuNSAwIDAgMSAyNS41IDEzLjUgWiIgZmlsbD0iIzZjNjNmZiIgb3BhY2l0eT0iLjM1Ii8+PGxpbmUgeDE9IjE2IiB5MT0iMTYiIHgyPSIxNiIgeTI9IjUuNSIgc3Ryb2tlPSIjOGI4M2ZmIiBzdHJva2Utd2lkdGg9IjEuNiIvPjxjaXJjbGUgY3g9IjIyIiBjeT0iMTAiIHI9IjIuMiIgZmlsbD0iIzM4YmRmOCIvPjwvc3ZnPg==">
+  <link rel="alternate icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iNyIgZmlsbD0iIzBkMTAyMCIvPjxjaXJjbGUgY3g9IjE2IiBjeT0iMTYiIHI9IjEwLjUiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzZjNjNmZiIgc3Ryb2tlLXdpZHRoPSIxLjQiIG9wYWNpdHk9Ii40NSIvPjxjaXJjbGUgY3g9IjE2IiBjeT0iMTYiIHI9IjYiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzZjNjNmZiIgc3Ryb2tlLXdpZHRoPSIxLjQiIG9wYWNpdHk9Ii43Ii8+PHBhdGggZD0iTTE2IDE2IEwxNiA1LjUgQTEwLjUgMTAuNSAwIDAgMSAyNS41IDEzLjUgWiIgZmlsbD0iIzZjNjNmZiIgb3BhY2l0eT0iLjM1Ii8+PGxpbmUgeDE9IjE2IiB5MT0iMTYiIHgyPSIxNiIgeTI9IjUuNSIgc3Ryb2tlPSIjOGI4M2ZmIiBzdHJva2Utd2lkdGg9IjEuNiIvPjxjaXJjbGUgY3g9IjIyIiBjeT0iMTAiIHI9IjIuMiIgZmlsbD0iIzM4YmRmOCIvPjwvc3ZnPg==">
+  <meta name="theme-color" content="#080b14">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js" defer></script>
@@ -1509,7 +1518,6 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 const ANALYTICS_ERR = {
-  q_required:         'Спочатку введіть ключове слово в полі пошуку.',
   period_not_allowed: 'AI-аналітика доступна лише для періодів «Доба» або «Тиждень».',
   no_posts:           'За цим запитом немає постів у вибраному періоді.',
   empty_texts:        'Знайдені пости порожні — нічого аналізувати.',
@@ -1534,6 +1542,10 @@ async function startAnalytics() {
     from_date: u.searchParams.get('from_date') || '',
     to_date:   u.searchParams.get('to_date') || '',
   };
+  // Заголовок блоку: при порожньому пошуку показуємо, що аналіз іде по останніх постах.
+  const qLabel = params.q
+    ? params.q
+    : (params.channel ? `останні пости: ${params.channel}` : 'останні пости (всі канали)');
 
   let startData;
   try {
@@ -1564,7 +1576,7 @@ async function startAnalytics() {
     try {
       const r = await fetch('/api/analytics/result/' + startData.hash);
       const j = await r.json();
-      if (j.state === 'done') renderAnalytics(j.data, params.q, meta);
+      if (j.state === 'done') renderAnalytics(j.data, qLabel, meta);
       else                    alert('Результат був у репо, але зник. Спробуйте ще раз.');
     } catch (e) {
       alert('Мережева помилка: ' + e.message);
@@ -1574,7 +1586,7 @@ async function startAnalytics() {
     return;
   }
 
-  showAnalyticsPending(params.q, meta);
+  showAnalyticsPending(qLabel, meta);
   btn.textContent = '⏳ Очікую cloud routine...';
 
   const deadline = Date.now() + ANALYTICS_POLL_MAX_MS;
@@ -1584,7 +1596,7 @@ async function startAnalytics() {
       const r = await fetch('/api/analytics/result/' + startData.hash);
       const j = await r.json();
       if (j.error) { alert(ANALYTICS_ERR[j.error] || ('Помилка: ' + j.error)); break; }
-      if (j.state === 'done') { renderAnalytics(j.data, params.q, meta); return; }
+      if (j.state === 'done') { renderAnalytics(j.data, qLabel, meta); return; }
       // 'pending' — продовжуємо
     }
     alert('Cloud routine не відповів за 65 хвилин. Відкрийте посилання на routine у блоці аналітики і натисніть "Run now".');
@@ -2569,7 +2581,7 @@ def _build_pack_md(hash_: str, q: str, channel: str, period: str,
     header = (
         "# max-parser analytics pack\n"
         f"# hash: {hash_}\n"
-        f"# q: {q}\n"
+        f"# q: {q or '(порожній — останні пости)'}\n"
         f"# channel: {channel or '(усі)'}\n"
         f"# period: {period}\n"
         f"# since_ts: {since_ts or ''}\n"
@@ -3167,9 +3179,9 @@ def api_analytics_start():
     Повертає {hash, routine_url, posts_used, posts_total, cached?} — фронт
     polling'ить /api/analytics/result/<hash>."""
     data = request.json or {}
+    # Порожній q дозволено: аналітика йде по останніх постах (вибраного каналу
+    # або всього парсера) — вибірку обмежує ANALYTICS_MAX_ROWS нижче.
     q = (data.get("q") or "").strip()
-    if not q:
-        return jsonify({"error": "q_required"}), 400
     channel = (data.get("channel") or "").strip()
     period_in = (data.get("period") or DEFAULT_PERIOD).strip()
     if period_in not in _ANALYTICS_ALLOWED_PERIODS:
@@ -3189,7 +3201,8 @@ def api_analytics_start():
 
     db = get_db()
     try:
-        rows = _query_export_rows(db, q, channel, since_ts, until_ts, sort="new")
+        rows = _query_export_rows(db, q, channel, since_ts, until_ts,
+                                  sort="new", limit=ANALYTICS_MAX_ROWS)
     finally:
         db.close()
 
@@ -3251,8 +3264,10 @@ _EXPORT_COL_WIDTHS = [22.875, 35.875, 14.875, 20.625, 103.375]
 
 
 def _query_export_rows(db, q: str, channel: str, since_ts: str | None,
-                       until_ts: str | None, sort: str) -> list[sqlite3.Row]:
-    """Повертає всі рядки за поточними фільтрами (без LIMIT — повна вибірка)."""
+                       until_ts: str | None, sort: str,
+                       limit: int | None = None) -> list[sqlite3.Row]:
+    """Повертає рядки за поточними фільтрами. Без limit — повна вибірка (XLSX);
+    з limit — стеля рядків (аналітика, щоб порожній q не тягнув усе у пам'ять)."""
     if q:
         fts_q = build_fts_query(q)
         sql = ("SELECT messages.* FROM messages "
@@ -3280,6 +3295,10 @@ def _query_export_rows(db, q: str, channel: str, since_ts: str | None,
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         order = "ORDER BY id ASC" if sort == "old" else "ORDER BY id DESC"
         sql = f"SELECT * FROM messages {where_sql} {order}"
+
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
 
     try:
         return db.execute(sql, params).fetchall()

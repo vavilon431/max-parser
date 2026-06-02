@@ -185,7 +185,7 @@ NER+syntax-пайплайн ~30-60 мс/пост. На 3000 постів (`MAX_R
 Кнопка "🧠 Аналітика" на дашборді — pipeline через GitHub + cloud routine на claude.ai. Дашборд **сам не викликає** Claude API; натомість commit'ить pack у репо, cloud routine його обробляє.
 
 **Flow:**
-1. Користувач натискає кнопку → JS POST'ить `/api/analytics/start` (`q` + `period=24h|7d`).
+1. Користувач натискає кнопку → JS POST'ить `/api/analytics/start` (`q` + `period=24h|7d`). `q` може бути **порожнім** — тоді аналіз іде по останніх постах (вибраного каналу або всього парсера); вибірку обмежує `ANALYTICS_MAX_ROWS`.
 2. Дашборд формує `<hash>.md` (метадані + system prompt із [summary.txt](summary.txt) + дамп постів), кладе у `/root/max-parser-repo/analytics/pending/`, `git commit + push origin main`.
 3. JS polling `/api/analytics/result/<hash>` кожні 10с (timeout 65 хв).
 4. Cloud routine `trig_01BuHdcdyvecVXpjMnbmDesM` (claude.ai) клонує репо, обробляє pending, commit'ить `results/<hash>.md`, push, видаляє pending.
@@ -205,7 +205,7 @@ NER+syntax-пайплайн ~30-60 мс/пост. На 3000 постів (`MAX_R
 
 **Що НЕ потрібне:** `.anthropic_key`, `.anthropic_gateway`, `.anthropic_gateway_token`, пакет `anthropic`. Видалено разом зі старим API-flow. Якщо файли ще є локально — можна видалити, не використовуються.
 
-**Ліміти:** 600k символів пакету (~150k токенів), пости > 1500 символів обрізаються. Періоди — тільки `24h` або `7d`.
+**Ліміти:** 600k символів пакету (~150k токенів), пости > 1500 символів обрізаються, вибірка постів — стеля `ANALYTICS_MAX_ROWS` (6000 найновіших; для порожнього `q` без неї вибірка по всіх каналах тягне сотні тисяч рядків у пам'ять). Періоди — тільки `24h` або `7d`. `summary.txt` — двохрежимний: за ключовим словом або (порожній `q`) по останніх постах загалом.
 
 ## resolve_channels.py — нюанси
 
