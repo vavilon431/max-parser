@@ -1161,11 +1161,18 @@ document.addEventListener('DOMContentLoaded', () => {
 // ── Динаміка згадок (Chart.js) ───────────────────────────────────────────────
 let timelineChart = null;
 const _MONTHS_UA = ['січ','лют','бер','кві','тра','чер','лип','сер','вер','жов','лис','гру'];
+const _WEEKDAYS_UA = ['нд','пн','вт','ср','чт','пт','сб'];
 
 function fmtDateUA(iso) {                       // '2026-04-27' → '27 кві 2026'
   if (!iso) return '';
   const [y, m, d] = iso.split('-');
   return parseInt(d,10) + ' ' + _MONTHS_UA[parseInt(m,10)-1] + ' ' + y;
+}
+
+function weekdayUA(iso) {                       // '2026-04-27' → 'сб' (без TZ-зсуву)
+  if (!iso) return '';
+  const [y, m, d] = iso.split('-').map(Number);
+  return _WEEKDAYS_UA[new Date(Date.UTC(y, m - 1, d)).getUTCDay()];
 }
 
 function pluralUA(n) {                          // 1 згадка / 2 згадки / 5 згадок
@@ -1433,7 +1440,7 @@ async function loadTimeline(days) {
           titleColor: '#c4bfff', bodyColor: '#e2e8f0',
           padding: 10, displayColors: false,
           callbacks: {
-            title: (items) => fmtDateUA(items[0].label),
+            title: (items) => fmtDateUA(items[0].label) + ' · ' + weekdayUA(items[0].label),
             label: (ctx) => {
               const isReach = ctx.dataset._kind === 'reach';
               if (isReach) return 'Охоплення: ' + fmtBig(ctx.parsed.y) + ' переглядів';

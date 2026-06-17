@@ -203,6 +203,8 @@ NER+syntax-пайплайн ~30-60 мс/пост. На 3000 постів (`MAX_R
 
 **Дані обміну:** `/root/max-parser-repo/` — окремий git-клон (через SSH deploy key). Не плутати з runtime-каталогом `/root/` (там `dashboard.py`, `matches.db`). Дашборд читає з / пише в `analytics/pending/` і `analytics/results/` через `subprocess` + `git`.
 
+**Troubleshooting «Не вдалось відправити pack у репо»:** обмінний клон і routine обоє пишуть у `main`, тому клон може розійтися з origin (`git -C /root/max-parser-repo status` показує `ahead N, behind M`). Тоді `git pull --ff-only` у `api_analytics_start` падає (exit 128, «Not possible to fast-forward»), за ним push (exit 1) → кнопка віддає 500. Фікс: `git -C /root/max-parser-repo reset --hard origin/main` — origin канонічний (там `analytics/results/`), локальні housekeeping-коміти невдалих спроб відкидаються без втрат. Після цього `pull --ff-only` знову проходить.
+
 **Що НЕ потрібне:** `.anthropic_key`, `.anthropic_gateway`, `.anthropic_gateway_token`, пакет `anthropic`. Видалено разом зі старим API-flow. Якщо файли ще є локально — можна видалити, не використовуються.
 
 **Ліміти:** 600k символів пакету (~150k токенів), пости > 1500 символів обрізаються, вибірка постів — стеля `ANALYTICS_MAX_ROWS` (6000 найновіших; для порожнього `q` без неї вибірка по всіх каналах тягне сотні тисяч рядків у пам'ять). Періоди — тільки `24h` або `7d`. `summary.txt` — двохрежимний: за ключовим словом або (порожній `q`) по останніх постах загалом.
