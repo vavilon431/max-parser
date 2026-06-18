@@ -2571,10 +2571,23 @@ def _git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
 
 
 def _git_pull() -> None:
-    """Fast-forward pull. Тиха помилка, якщо нема мережі — наступний polling
-    спробує знову."""
+    """Fast-forward pull. Якщо клон розійшовся з origin (ahead/behind через
+    housekeeping-коміти невдалих спроб + паралельні записи routine у main) —
+    ff-pull падає; тоді жорстко вирівнюємо клон до origin/main. Origin
+    канонічний (там results/), локальні коміти втрачати безпечно. Тиха
+    помилка, якщо нема мережі — наступний polling спробує знову."""
     try:
         _git("pull", "--ff-only", "--quiet", "origin", "main")
+    except subprocess.CalledProcessError as e:
+        # git відпрацював, але ff не вдався — найімовірніше клон ahead/behind.
+        # fetch уже відбувся всередині pull, тож origin/main свіжий.
+        print(f"[analytics] ff-only pull failed, resetting to origin/main: {e}",
+              flush=True)
+        try:
+            _git("fetch", "--quiet", "origin", "main")
+            _git("reset", "--hard", "origin/main")
+        except (subprocess.SubprocessError, OSError) as e2:
+            print(f"[analytics] reset to origin/main failed: {e2}", flush=True)
     except (subprocess.SubprocessError, OSError) as e:
         print(f"[analytics] git pull failed: {e}", flush=True)
 
